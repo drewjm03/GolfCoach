@@ -11,7 +11,6 @@ POSE_STOP_JOIN_TIMEOUT_S = 0.2        # join timeout for pose thread on stop
 EMA_ALPHA = 0.03                      # EMA coefficient for offset
 USE_SDK_EXPOSURE = False              # if True, set exposure via SDK (microseconds)
 CAPTURE_FPS = 120                     # target camera FPS
-EXPOSURE_DELTA_US = 100                # amount to change exposure with keys (manual path)
 MIN_EXPOSURE_US = 50                  # absolute minimum exposure
 SAFETY_EXPOSURE_HEADROOM_US = 100     # keep under frame period by this much
 AUTO_EXPOSURE_COMP_DELTA_US = 50      # delta for SDK exposure compensation when auto
@@ -98,21 +97,24 @@ for i, pid in enumerate(cam_ids): print(f"[INFO] SDK device {i} instance path: {
 
 # ---------- Helper function to set exposure compensation ----------
 def set_sdk_exposure_us_for_device(instance_path, target_us):
-    """Set sensor exposure time on a specific device via Extension Unit (absolute µs)."""
+    """Set sensor exposure time on a specific device via Extension Unit (absolute µs).
+    Returns read-back exposure in µs on success, else None.
+    """
     inited = False
     try:
         if not dll.InitExtensionUnit(instance_path):
             print(f"[SDK] ERROR: InitExtensionUnit failed for {instance_path}")
-            return False
+            return None
         inited = True
         ok = dll.SetExposureCompensation24CUG(UINT32(int(target_us)))
         if not ok:
             print("[SDK] WARNING: SetExposureCompensation24CUG failed")
-            return False
+            return None
         cur = UINT32(0)
         if dll.GetExposureCompensation24CUG(ctypes.byref(cur)):
             print(f"[SDK] Exposure now ~{cur.value} µs for device")
-        return True
+            return cur.value
+        return int(target_us)
     finally:
         if inited:
             dll.DeinitExtensionUnit()
@@ -156,7 +158,19 @@ def sdk_config(instance_path, fps=120, lock_autos=True, anti_flicker_60hz=True, 
         # >>> set exposure here while the extension unit session is open <<<
         if exposure_us is not None:
             limit = max_exposure_us_for_fps(fps, safety_us=300)
-            set_sdk_exposure_us_for_device(instance_path, min(int(exposure_us), limit))
+            target_us = min(int(exposure_us), limit)
+            if not dll.SetExposureCompensation24CUG(UINT32(target_us)):
+                print("[SDK] WARNING: SetExposureCompensation24CUG failed")
+            else:
+                cur = UINT32(0)
+                if dll.GetExposureCompensation24CUG(ctypes.byref(cur)):
+                    print(f"[SDK] Exposure now ~{cur.value} µs")
+                    # Keep overlay truthful if starting in auto
+                    try:
+                        global current_exposure_us
+                        current_exposure_us = cur.value
+                    except Exception:
+                        pass
 
         print(f"[SDK] Master+AFL, FPS={fps} requested")
         return True
@@ -585,7 +599,9 @@ def main():
                         current_exposure_us = max_exposure_us_for_fps(CAPTURE_FPS, SAFETY_EXPOSURE_HEADROOM_US)
                     current_exposure_us = max(MIN_EXPOSURE_US, current_exposure_us - AUTO_EXPOSURE_COMP_DELTA_US)
                     for iid in ACTIVE_SDK_DEVICE_PATHS:
-                        set_sdk_exposure_us_for_device(iid, current_exposure_us)
+                        rb = set_sdk_exposure_us_for_device(iid, current_exposure_us)
+                        if rb is not None:
+                            current_exposure_us = rb
                     print(f"[KEY] ',' pressed (auto). Exposure compensation -> {current_exposure_us} us")
                 else:
                     # Adjust manual UVC step
@@ -600,7 +616,9 @@ def main():
                     limit = max_exposure_us_for_fps(CAPTURE_FPS, SAFETY_EXPOSURE_HEADROOM_US)
                     current_exposure_us = min(limit, current_exposure_us + AUTO_EXPOSURE_COMP_DELTA_US)
                     for iid in ACTIVE_SDK_DEVICE_PATHS:
-                        set_sdk_exposure_us_for_device(iid, current_exposure_us)
+                        rb = set_sdk_exposure_us_for_device(iid, current_exposure_us)
+                        if rb is not None:
+                            current_exposure_us = rb
                     print(f"[KEY] '.' pressed (auto). Exposure compensation -> {current_exposure_us} us")
                 else:
                     current_exposure_step = min(MAX_EXPOSURE_STEP, int(current_exposure_step) + 1)
