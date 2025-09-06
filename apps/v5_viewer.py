@@ -190,12 +190,37 @@ def main():
                 status = f"{'SYNC' if dt_ms<=15 else 'UNSYNC'} ({dt_ms:.1f} ms)"
                 frames.append(f1)
 
-            for i, fr in enumerate(frames):
-                cv2.putText(fr, f"cam{i} FPS: {cams[i].fps:.1f}", (16,36),
+            # Create side-by-side display
+            if len(frames) == 2:
+                # Resize frames to same height if needed
+                h1, w1 = frames[0].shape[:2]
+                h2, w2 = frames[1].shape[:2]
+                target_h = max(h1, h2)
+                
+                # Resize frames to target height
+                if h1 != target_h:
+                    frames[0] = cv2.resize(frames[0], (int(w1 * target_h / h1), target_h))
+                if h2 != target_h:
+                    frames[1] = cv2.resize(frames[1], (int(w2 * target_h / h2), target_h))
+                
+                # Add text overlays
+                cv2.putText(frames[0], f"cam0 FPS: {cams[0].fps:.1f}", (16,36),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                cv2.putText(frames[1], f"cam1 FPS: {cams[1].fps:.1f}", (16,36),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
                 if status:
-                    cv2.putText(fr, status, (16,72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
-                cv2.imshow(f"cam{i}", fr)
+                    cv2.putText(frames[0], status, (16,72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+                    cv2.putText(frames[1], status, (16,72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+                
+                # Concatenate horizontally
+                combined_frame = cv2.hconcat(frames)
+                cv2.imshow("Dual Camera View", combined_frame)
+            else:
+                # Single camera fallback
+                cv2.putText(frames[0], f"cam0 FPS: {cams[0].fps:.1f}", (16,36),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                cv2.imshow("Dual Camera View", frames[0])
+                
             if cv2.waitKey(1) == 27: break
     finally:
         for c in cams: c.release()
