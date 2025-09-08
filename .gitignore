@@ -1,0 +1,5 @@
+# Recorded videos (saved by apps/v6_recorder.py)
+data/**/*.mp4
+data/**/*.MP4
+
+

@@ -1,4 +1,5 @@
 import ctypes, cv2, time, threading, queue, os
+import json, csv, datetime
 
 # ---------- Tunable constants ----------
 DEFAULT_EXPOSURE_STEP = -7            # −8 ≈ 3.9ms, −7 ≈ 7.8ms
@@ -24,6 +25,15 @@ MAX_GAIN = 255.0                      # max UVC gain (driver dependent)
 auto_exposure_on = False
 current_exposure_step = -7
 current_gain = None                   # track last known UVC gain value
+
+# ---------- Recording state ----------
+recording_on = False
+record_dir = None
+video_writers = []                    # cv2.VideoWriter per cam
+keypoint_files = []                   # open file handles per cam
+keypoint_csv_writers = []             # csv.writer per cam
+frame_indices = []                    # simple counters per cam
+session_meta_written = False
 
 # ---------- Optional: MediaPipe (BlazePose) import ----------
 HAVE_MP, MP_IMPORT_ERR = False, ""
@@ -410,8 +420,109 @@ class PoseEstimator:
             except RuntimeError:
                 pass
 
+# ---------- Keypoints serialization helpers ----------
+def landmarks_to_row(ts_frame, ts_lm, frame_w, frame_h, landmarks):
+    """Convert MediaPipe normalized landmarks to a flat CSV row.
+    Includes: ts_frame, ts_landmarks, frame_w, frame_h, then for each of 33 points: x_px, y_px, z_rel, visibility.
+    If landmarks is None, writes NaNs for all keypoint fields.
+    """
+    row = [f"{ts_frame:.9f}", f"{(ts_lm if ts_lm is not None else float('nan')):.9f}", frame_w, frame_h]
+    num_points = 33
+    if landmarks is None:
+        for _ in range(num_points):
+            row.extend([float('nan'), float('nan'), float('nan'), float('nan')])
+        return row
+    lm_list = landmarks.landmark if hasattr(landmarks, 'landmark') else []
+    for idx in range(num_points):
+        if idx < len(lm_list):
+            lm = lm_list[idx]
+            x_px = float(lm.x) * float(frame_w)
+            y_px = float(lm.y) * float(frame_h)
+            z_rel = float(getattr(lm, 'z', 0.0))
+            vis = float(getattr(lm, 'visibility', 0.0))
+            row.extend([x_px, y_px, z_rel, vis])
+        else:
+            row.extend([float('nan'), float('nan'), float('nan'), float('nan')])
+    return row
+
+def keypoints_csv_header():
+    base = ["ts_frame", "ts_landmarks", "frame_w", "frame_h"]
+    cols = []
+    for i in range(33):
+        cols.extend([f"l{i}_x_px", f"l{i}_y_px", f"l{i}_z_rel", f"l{i}_vis"])
+    return base + cols
+
+def ensure_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+def create_session(cams):
+    global record_dir, video_writers, keypoint_files, keypoint_csv_writers, frame_indices, session_meta_written
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.normpath(os.path.join(base_dir, ".."))
+    record_dir = os.path.join(repo_root, "data", ts)
+    record_dir = os.path.normpath(record_dir)
+    ensure_dir(record_dir)
+
+    video_writers = []
+    keypoint_files = []
+    keypoint_csv_writers = []
+    frame_indices = [0 for _ in cams]
+    session_meta_written = False
+
+    # Create per-cam writers
+    for i, cam in enumerate(cams):
+        w = int(cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        vpath = os.path.join(record_dir, f"cam{i}.mp4")
+        vw = cv2.VideoWriter(vpath, fourcc, float(CAPTURE_FPS), (w, h))
+        video_writers.append(vw)
+
+        kpath = os.path.join(record_dir, f"keypoints_cam{i}.csv")
+        kf = open(kpath, "w", newline="", encoding="utf-8")
+        kw = csv.writer(kf)
+        kw.writerow(keypoints_csv_header())
+        keypoint_files.append(kf)
+        keypoint_csv_writers.append(kw)
+
+    # Write meta.json
+    meta = {
+        "capture_fps": CAPTURE_FPS,
+        "cams": [
+            {
+                "index": i,
+                "negotiated_width": int(c.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                "negotiated_height": int(c.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                "sdk_instance_path": (ACTIVE_SDK_DEVICE_PATHS[i] if i < len(ACTIVE_SDK_DEVICE_PATHS) else None),
+            } for i, c in enumerate(cams)
+        ],
+        "note": "Keypoints are 2D pixel coordinates per frame for 33 pose landmarks. Align by ts_frame across cams, with ts_landmarks from estimator.",
+    }
+    with open(os.path.join(record_dir, "meta.json"), "w", encoding="utf-8") as mf:
+        json.dump(meta, mf, indent=2)
+    session_meta_written = True
+
+def close_session():
+    global video_writers, keypoint_files, keypoint_csv_writers
+    for vw in video_writers:
+        try:
+            vw.release()
+        except Exception:
+            pass
+    for f in keypoint_files:
+        try:
+            f.flush()
+            f.close()
+        except Exception:
+            pass
+    video_writers = []
+    keypoint_files = []
+    keypoint_csv_writers = []
+
 def main():
-    global current_exposure_us, auto_exposure_on, current_exposure_step
+    global current_exposure_us, auto_exposure_on, current_exposure_step, recording_on
     print("[MAIN] Opening two cameras…")
     cams = []
     # Optional: allow explicit OpenCV index order via env var, e.g., "1,0"
@@ -538,6 +649,10 @@ def main():
                 if w > MAX_COMBINED_WIDTH:
                     scale = MAX_COMBINED_WIDTH / float(w)
                     combined_frame = cv2.resize(combined_frame, (MAX_COMBINED_WIDTH, int(round(h * scale))))
+                # REC indicator
+                if recording_on:
+                    cv2.putText(combined_frame, "REC", (combined_frame.shape[1]-100, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
                 cv2.imshow("Dual Camera View", combined_frame)
             else:
                 # Single camera fallback
@@ -555,8 +670,33 @@ def main():
                     cv2.putText(annotated_frames[0], f"Gain: {current_gain:.1f}",
                                 (16, annotated_frames[0].shape[0]-48),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                if recording_on:
+                    cv2.putText(annotated_frames[0], "REC", (annotated_frames[0].shape[1]-100, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
                 cv2.imshow("Dual Camera View", annotated_frames[0])
                 
+            # Write recording outputs (videos + keypoints)
+            if recording_on and video_writers:
+                # Write raw frames per cam
+                for i, fr in enumerate(frames):
+                    try:
+                        video_writers[i].write(fr)
+                    except Exception:
+                        pass
+                # Serialize keypoints per cam (if MediaPipe available)
+                for i in range(len(frames)):
+                    w_i = int(cams[i].cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h_i = int(cams[i].cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    latest = estimators[i].latest_result() if HAVE_MP else None
+                    ts_lm = latest[0] if (latest and latest[1] is not None) else None
+                    lm = latest[1] if (latest and latest[1] is not None) else None
+                    ts_frame = (ts0 if i == 0 else ts1) if len(frames) > 1 else ts0
+                    row = landmarks_to_row(ts_frame, ts_lm, w_i, h_i, lm)
+                    try:
+                        keypoint_csv_writers[i].writerow(row)
+                    except Exception:
+                        pass
+
             key = cv2.waitKey(1) & 0xFF
             if key == 27:
                 break
@@ -592,6 +732,15 @@ def main():
                         set_manual_exposure_uvc(c.cap, step=current_exposure_step)
                     for iid in ACTIVE_SDK_DEVICE_PATHS:
                         set_sdk_lock_autos(iid, lock_autos=True)
+            elif key == ord('r'):
+                # Toggle recording
+                recording_on = not recording_on
+                if recording_on:
+                    print("[KEY] 'r' pressed. Recording START")
+                    create_session(cams)
+                else:
+                    print("[KEY] 'r' pressed. Recording STOP")
+                    close_session()
             elif key == ord(',') or key == 44:  # decrease exposure
                 if auto_exposure_on:
                     # Adjust SDK exposure compensation (us)
@@ -646,6 +795,11 @@ def main():
                 except Exception as e:
                     print("[KEY] Gain increase failed:", e)
     finally:
+        if recording_on:
+            try:
+                close_session()
+            except Exception:
+                pass
         for est in estimators:
             est.stop()
         for c in cams: c.release()
