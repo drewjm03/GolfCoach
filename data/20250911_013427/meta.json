@@ -1,0 +1,12 @@
+{
+  "capture_fps": 120,
+  "cams": [
+    {
+      "index": 0,
+      "negotiated_width": 1280,
+      "negotiated_height": 720,
+      "sdk_instance_path": "\\\\?\\USB#VID_2560&PID_C128&MI_00#7&3CF22F9&0&0000#{65E8773D-8F56-11D0-A3B9-00A0C9223196}\\GLOBAL"
+    }
+  ],
+  "note": "Keypoints are 2D pixel coordinates per frame for 33 pose landmarks. Align by ts_frame across cams, with ts_landmarks from estimator."
+}

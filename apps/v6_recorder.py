@@ -188,7 +188,7 @@ def sdk_config(instance_path, fps=120, lock_autos=True, anti_flicker_60hz=True, 
         if inited:
             dll.DeinitExtensionUnit()
             print("[SDK] DeinitExtensionUnit")
-
+ 
 
 ACTIVE_SDK_DEVICE_PATHS = cam_ids[:2]
 for iid in ACTIVE_SDK_DEVICE_PATHS:
