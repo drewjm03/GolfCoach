@@ -188,7 +188,7 @@ def sdk_config(instance_path, fps=120, lock_autos=True, anti_flicker_60hz=True, 
         if inited:
             dll.DeinitExtensionUnit()
             print("[SDK] DeinitExtensionUnit")
- 
+
 
 ACTIVE_SDK_DEVICE_PATHS = cam_ids[:2]
 for iid in ACTIVE_SDK_DEVICE_PATHS:
@@ -289,6 +289,26 @@ def open_cam(index, w=1280, h=720, fps=120, fourcc="MJPG"):
         fourcc_readable = "".join([chr((fc_val >> (8 * i)) & 0xFF) for i in range(4)])
         print(f"[CV] cam{index} negotiated: {got_w}x{got_h} @ {got_f:.2f} (FOURCC={fourcc_readable})")
 
+        # If negotiated FPS is far below target, try alternate FOURCC and retry
+        try:
+            if (isinstance(got_f, (int, float)) and got_f > 0 and got_f < (0.75 * fps)):
+                print(f"[CV] cam{index} FPS {got_f:.2f} < target {fps}. Trying FOURCC=YUY2…")
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUY2"))
+                cap.set(cv2.CAP_PROP_FPS, fps)
+                time.sleep(0.05)
+                got_f2 = cap.get(cv2.CAP_PROP_FPS)
+                fc_val2 = int(cap.get(cv2.CAP_PROP_FOURCC))
+                fourcc_readable2 = "".join([chr((fc_val2 >> (8 * i)) & 0xFF) for i in range(4)])
+                print(f"[CV] cam{index} retry negotiated: {got_w}x{got_h} @ {got_f2:.2f} (FOURCC={fourcc_readable2})")
+                if isinstance(got_f2, (int, float)) and got_f2 > 0 and got_f2 >= (0.75 * fps):
+                    got_f = got_f2
+                else:
+                    print(f"[CV] cam{index} still below target FPS. Releasing and trying next backend…")
+                    cap.release()
+                    continue
+        except Exception as _fps_retry_err:
+            print("[CV] FPS retry check failed:", _fps_retry_err)
+
         ok = False
         for _ in range(FIRST_FRAME_RETRY_COUNT):
             ok, _ = cap.read()
@@ -316,6 +336,11 @@ class CamReader:
             ok, f = self.cap.read()
             if not ok:
                 time.sleep(0.002); continue
+            # Apply vertical flip for reliability across preview, pose, and recording
+            try:
+                f = cv2.flip(f, 0)
+            except Exception:
+                pass
             ts = time.perf_counter()
             if self.q.full():
                 try: self.q.get_nowait()
@@ -620,9 +645,9 @@ def main():
                     annotated_frames[1] = cv2.resize(annotated_frames[1], (int(w2 * target_h / h2), target_h))
                 
                 # Add text overlays
-                cv2.putText(annotated_frames[0], f"cam0 FPS: {cams[0].fps:.1f}", (16,36),
+                cv2.putText(annotated_frames[0], f"cam0 FPS:{cams[0].fps:.1f} target:{int(CAPTURE_FPS)}", (16,36),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-                cv2.putText(annotated_frames[1], f"cam1 FPS: {cams[1].fps:.1f}", (16,36),
+                cv2.putText(annotated_frames[1], f"cam1 FPS:{cams[1].fps:.1f} target:{int(CAPTURE_FPS)}", (16,36),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
                 if status:
                     cv2.putText(annotated_frames[0], status, (16,72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
@@ -656,7 +681,7 @@ def main():
                 cv2.imshow("Dual Camera View", combined_frame)
             else:
                 # Single camera fallback
-                cv2.putText(annotated_frames[0], f"cam0 FPS: {cams[0].fps:.1f}", (16,36),
+                cv2.putText(annotated_frames[0], f"cam0 FPS:{cams[0].fps:.1f} target:{int(CAPTURE_FPS)}", (16,36),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
                 if auto_exposure_on and current_exposure_us is not None:
                     cv2.putText(annotated_frames[0], f"Auto Exp: {int(current_exposure_us)} us",
