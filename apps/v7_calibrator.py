@@ -32,12 +32,12 @@ MIN_GAIN = 0.0
 MAX_GAIN = 255.0
 GAIN_DELTA = 1.0
 
-# AprilTag grid board configuration (EDIT to match your physical board)
+# AprilTag grid board configuration 
 APRIL_DICT = cv2.aruco.DICT_APRILTAG_36h11
-TAGS_X = 7                # number of tags horizontally
+TAGS_X = 8                # number of tags horizontally
 TAGS_Y = 5                # number of tags vertically
-TAG_SIZE_M = 0.07         # tag black square size in meters
-TAG_SEP_M = 0.01          # white gap between tags in meters
+TAG_SIZE_M = 0.075         # tag black square size in meters
+TAG_SEP_M = 0.01875          # white gap between tags in meters
 
 # Calibration parameters/criteria
 MIN_MARKERS_PER_VIEW = 8
