@@ -632,7 +632,8 @@ def main():
 
     # AprilTag GridBoard
     dictionary = cv2.aruco.getPredefinedDictionary(APRIL_DICT)
-    board = cv2.aruco.GridBoard_create(TAGS_X, TAGS_Y, TAG_SIZE_M, TAG_SEP_M, dictionary)
+    # OpenCV >=4.7: use GridBoard class constructor with (markersX, markersY) tuple
+    board = cv2.aruco.GridBoard((TAGS_X, TAGS_Y), TAG_SIZE_M, TAG_SEP_M, dictionary)
     acc = CalibrationAccumulator(board, image_size)
     results = CalibrationResults()
     best_stereo_rms = float("inf")
