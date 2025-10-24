@@ -2,6 +2,7 @@
 data/**/*.mp4
 data/**/*.MP4
 apps/v6_recorder_mac.py
+.venv/
 
 
 
