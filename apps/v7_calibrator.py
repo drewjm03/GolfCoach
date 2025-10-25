@@ -747,6 +747,22 @@ def main():
                         else:
                             mp_drawing.draw_landmarks(annotated[i], latest[1], mp_pose.POSE_CONNECTIONS)
 
+            # Detection overlay when calibrating: draw detected markers per view
+            det_counts = (0, 0)
+            if state["calibrating"]:
+                try:
+                    g0 = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+                    g1 = cv2.cvtColor(frames[1], cv2.COLOR_BGR2GRAY)
+                    c0, i0 = acc.detector.detectMarkers(g0)
+                    c1, i1 = acc.detector.detectMarkers(g1)
+                    if c0:
+                        cv2.aruco.drawDetectedMarkers(annotated[0], c0, i0)
+                    if c1:
+                        cv2.aruco.drawDetectedMarkers(annotated[1], c1, i1)
+                    det_counts = (len(i0) if i0 is not None else 0, len(i1) if i1 is not None else 0)
+                except Exception:
+                    pass
+
             # UI buttons and status
             for img in annotated:
                 btn_cal.draw(img)
@@ -754,6 +770,7 @@ def main():
             status_lines = []
             if state["calibrating"]:
                 status_lines.append(f"Calibrating… n0={len(acc.corners0)} n1={len(acc.corners1)} ns={len(acc.stereo_samples)}")
+                status_lines.append(f"Detected tags: cam0={det_counts[0]} cam1={det_counts[1]}")
             if results.rms0 is not None:
                 status_lines.append(f"RMS0={results.rms0:.3f}")
             if results.rms1 is not None:
