@@ -33,6 +33,11 @@ MIN_GAIN = 0.0
 MAX_GAIN = 255.0
 GAIN_DELTA = 1.0
 
+# Runtime exposure/gain state
+auto_exposure_on = False
+current_exposure_step = DEFAULT_EXPOSURE_STEP
+current_gain = None
+
 # AprilTag grid board configuration 
 APRIL_DICT = cv2.aruco.DICT_APRILTAG_36h11
 TAGS_X = 8                # number of tags horizontally
@@ -669,6 +674,14 @@ def main():
     if not cams:
         print("[ERR] no cameras opened"); return
     print(f"[MAIN] Using {len(cams)} cam(s)")
+    # Initialize current_gain from first camera if available
+    try:
+        g = cams[0].cap.get(cv2.CAP_PROP_GAIN)
+        current_gain = float(g) if g is not None else None
+        if current_gain is not None:
+            print(f"[CV] Initial gain read-back: {current_gain}")
+    except Exception:
+        current_gain = None
 
     # Get one frame to determine image size
     ts0, f0 = cams[0].latest()
@@ -801,6 +814,13 @@ def main():
             if state["calibrating"]:
                 status_lines.append(f"Calibrating… n0={len(acc.corners0)} n1={len(acc.corners1)} ns={len(acc.stereo_samples)}")
                 status_lines.append(f"Detected tags: cam0={det_counts[0]} cam1={det_counts[1]}")
+            # Exposure/Gain readout
+            if auto_exposure_on:
+                status_lines.append("Exposure: Auto (UVC)")
+            else:
+                status_lines.append(f"Exposure: Manual step {int(current_exposure_step)}")
+            if current_gain is not None:
+                status_lines.append(f"Gain: {current_gain:.1f}")
             if results.rms0 is not None:
                 status_lines.append(f"RMS0={results.rms0:.3f}")
             if results.rms1 is not None:
@@ -848,6 +868,48 @@ def main():
                     estimators[i].stop()
                 estimators = [PoseEstimator(enable=pose_on, model_complexity=1, inference_width=640, inference_fps=30)
                               for _ in cams]
+            elif key == ord('e'):
+                # Toggle auto/manual exposure via UVC only (SDK locked unless USE_SDK_EXPOSURE)
+                auto_exposure_on = not auto_exposure_on
+                print(f"[KEY] Auto exposure -> {auto_exposure_on}")
+                if auto_exposure_on:
+                    for c in cams:
+                        set_auto_exposure_uvc(c.cap)
+                else:
+                    for c in cams:
+                        set_manual_exposure_uvc(c.cap, step=current_exposure_step)
+            elif key == ord(',') or key == 44:  # decrease exposure
+                if not auto_exposure_on:
+                    current_exposure_step = max(MIN_EXPOSURE_STEP, int(current_exposure_step) - 1)
+                    for c in cams:
+                        set_manual_exposure_uvc(c.cap, step=current_exposure_step)
+                    print(f"[KEY] Exposure step -> {current_exposure_step}")
+            elif key == ord('.') or key == 46:  # increase exposure
+                if not auto_exposure_on:
+                    current_exposure_step = min(MAX_EXPOSURE_STEP, int(current_exposure_step) + 1)
+                    for c in cams:
+                        set_manual_exposure_uvc(c.cap, step=current_exposure_step)
+                    print(f"[KEY] Exposure step -> {current_exposure_step}")
+            elif key == ord(';') or key == 59:  # decrease gain
+                try:
+                    if current_gain is None:
+                        current_gain = float(cams[0].cap.get(cv2.CAP_PROP_GAIN))
+                    current_gain = max(MIN_GAIN, current_gain - GAIN_DELTA)
+                    for c in cams:
+                        set_uvc_gain(c.cap, current_gain)
+                    print(f"[KEY] Gain -> {current_gain}")
+                except Exception as e:
+                    print("[KEY] Gain decrease failed:", e)
+            elif key == ord("'") or key == 39:  # increase gain
+                try:
+                    if current_gain is None:
+                        current_gain = float(cams[0].cap.get(cv2.CAP_PROP_GAIN))
+                    current_gain = min(MAX_GAIN, current_gain + GAIN_DELTA)
+                    for c in cams:
+                        set_uvc_gain(c.cap, current_gain)
+                    print(f"[KEY] Gain -> {current_gain}")
+                except Exception as e:
+                    print("[KEY] Gain increase failed:", e)
             elif key == ord('s'):
                 # Save calibration JSON stub and counts; easy to extend for CSV export later
                 if results.is_complete():
