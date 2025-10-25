@@ -687,15 +687,12 @@ def main():
                               for _ in cams]
 
     win = "Stereo Calibrator"
-    if PRESERVE_NATIVE_RES:
-        cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-        # Keep aspect ratio in case the OS resizes the window
-        try:
-            cv2.setWindowProperty(win, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
-        except Exception:
-            pass
-    else:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    # Make window resizable while preserving aspect ratio
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    try:
+        cv2.setWindowProperty(win, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
+    except Exception:
+        pass
     cv2.setMouseCallback(win, on_mouse)
 
     try:
@@ -774,16 +771,17 @@ def main():
                 for k, line in enumerate(status_lines):
                     cv2.putText(img, line, (16, y0 + 28*k), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
 
-            # Side-by-side
+            # Stack vertically with preserved aspect ratio (align widths)
             h1, w1 = annotated[0].shape[:2]
             h2, w2 = annotated[1].shape[:2]
-            target_h = max(h1, h2)
-            if h1 != target_h:
-                annotated[0] = cv2.resize(annotated[0], (int(w1 * target_h / h1), target_h))
-            if h2 != target_h:
-                annotated[1] = cv2.resize(annotated[1], (int(w2 * target_h / h2), target_h))
-            combined = cv2.hconcat(annotated)
+            target_w = max(w1, w2)
+            if w1 != target_w:
+                annotated[0] = cv2.resize(annotated[0], (target_w, int(round(h1 * target_w / float(w1)))))
+            if w2 != target_w:
+                annotated[1] = cv2.resize(annotated[1], (target_w, int(round(h2 * target_w / float(w2)))))
+            combined = cv2.vconcat(annotated)
             h,w = combined.shape[:2]
+            # Do not downscale when preserving native resolution; allow user to resize window
             if (not PRESERVE_NATIVE_RES) and w > MAX_COMBINED_WIDTH:
                 scale = MAX_COMBINED_WIDTH / float(w)
                 combined = cv2.resize(combined, (MAX_COMBINED_WIDTH, int(round(h*scale))))
