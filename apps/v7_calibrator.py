@@ -1,6 +1,11 @@
 import ctypes, cv2, time, threading, queue, os, sys, json
 import numpy as np
 
+print(cv2.__version__)
+print("ArucoDetector?", hasattr(cv2.aruco, "ArucoDetector"))
+print("AprilTag in build?", "AprilTag" in cv2.getBuildInformation())
+
+
 # Optional sound on Windows
 try:
     import winsound
