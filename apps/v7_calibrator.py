@@ -431,15 +431,21 @@ class CalibrationAccumulator:
         id_to_obj = {}
         try:
             ids = self.board.ids.flatten().astype(int)
+            obj_points = self.board.getObjPoints()
             for idx, tag_id in enumerate(ids):
-                obj = np.array(self.board.objPoints[idx], dtype=np.float32).reshape(-1, 3)
+                obj = np.array(obj_points[idx], dtype=np.float32).reshape(-1, 3)
                 id_to_obj[int(tag_id)] = obj
-        except Exception:
+        except Exception as e:
             # Fallback: assume sequential ids 0..N-1
             N = TAGS_X * TAGS_Y
-            for idx in range(N):
-                obj = np.array(self.board.objPoints[idx], dtype=np.float32).reshape(-1, 3)
-                id_to_obj[idx] = obj
+            try:
+                obj_points = self.board.getObjPoints()
+                for idx in range(N):
+                    obj = np.array(obj_points[idx], dtype=np.float32).reshape(-1, 3)
+                    id_to_obj[idx] = obj
+            except Exception as inner_e:
+                print(f"[ERROR] Could not get object points: {inner_e}")
+                id_to_obj = {}
         return id_to_obj
 
     def detect(self, gray):
