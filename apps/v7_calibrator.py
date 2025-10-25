@@ -1,5 +1,11 @@
 import ctypes, cv2, time, threading, queue, os, sys, json
 import numpy as np
+try:
+    from pupil_apriltags import Detector as PupilDetector
+    HAVE_PUPIL = True
+except Exception:
+    PupilDetector = None
+    HAVE_PUPIL = False
 
 print(cv2.__version__)
 print("ArucoDetector?", hasattr(cv2.aruco, "ArucoDetector"))
@@ -420,6 +426,17 @@ class CalibrationAccumulator:
         self.board = board
         self.image_size = image_size
         self.detector = self._make_detector()
+        # Prefer pupil-apriltags when available or when OpenCV build lacks AprilTag
+        self._pupil = None
+        if HAVE_PUPIL:
+            self._pupil = PupilDetector(
+                families=self._apriltag_family_string(),
+                nthreads=2,
+                quad_decimate=1.0,
+                quad_sigma=0.0,
+                refine_edges=True,
+                decode_sharpening=0.25,
+            )
         # Per-cam accumulators for mono calibration
         self.corners0, self.ids0, self.counter0 = [], [], []
         self.corners1, self.ids1, self.counter1 = [], [], []
@@ -467,6 +484,21 @@ class CalibrationAccumulator:
             pass
         return cv2.aruco.ArucoDetector(dictionary, params)
 
+    def _apriltag_family_string(self):
+        # Map OpenCV AprilTag dict to pupil-apriltags family string
+        try:
+            if APRIL_DICT == cv2.aruco.DICT_APRILTAG_36h11:
+                return "tag36h11"
+            if hasattr(cv2.aruco, 'DICT_APRILTAG_25h9') and APRIL_DICT == cv2.aruco.DICT_APRILTAG_25h9:
+                return "tag25h9"
+            if hasattr(cv2.aruco, 'DICT_APRILTAG_16h5') and APRIL_DICT == cv2.aruco.DICT_APRILTAG_16h5:
+                return "tag16h5"
+            if hasattr(cv2.aruco, 'DICT_APRILTAG_36h10') and APRIL_DICT == cv2.aruco.DICT_APRILTAG_36h10:
+                return "tag36h10"
+        except Exception:
+            pass
+        return "tag36h11"
+
     def _build_id_to_object(self):
         # GridBoard has .ids (Nx1) and .objPoints list length N with 4x3 points
         id_to_obj = {}
@@ -490,10 +522,26 @@ class CalibrationAccumulator:
         return id_to_obj
 
     def detect(self, gray):
+        # Prefer pupil-apriltags if available
+        if self._pupil is not None:
+            dets = self._pupil.detect(gray, estimate_tag_pose=False)
+            if not dets:
+                return [], None
+            corners = []
+            ids = []
+            for d in dets:
+                c = np.array(d.corners, dtype=np.float32).reshape(1, 4, 2)
+                corners.append(c)
+                ids.append([int(d.tag_id)])
+            ids = np.array(ids, dtype=np.int32)
+            for c in corners:
+                cv2.cornerSubPix(gray, c.squeeze(0), (3,3), (-1,-1),
+                                 (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 10, 0.01))
+            return corners, ids
+        # Fallback to OpenCV aruco apriltag integration
         corners, ids, _ = self.detector.detectMarkers(gray)
         if ids is None or len(corners) == 0:
             return [], None
-        # Optionally subpixel refine
         for c in corners:
             cv2.cornerSubPix(gray, c.squeeze(1), (3,3), (-1,-1),
                              (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 10, 0.01))
@@ -802,8 +850,8 @@ def main():
                 try:
                     g0 = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
                     g1 = cv2.cvtColor(frames[1], cv2.COLOR_BGR2GRAY)
-                    c0, i0 = acc.detector.detectMarkers(g0)
-                    c1, i1 = acc.detector.detectMarkers(g1)
+                    c0, i0 = acc.detect(g0)
+                    c1, i1 = acc.detect(g1)
                     if c0:
                         cv2.aruco.drawDetectedMarkers(annotated[0], c0, i0)
                     if c1:
