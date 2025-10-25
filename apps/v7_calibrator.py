@@ -618,9 +618,21 @@ def main():
     print("[MAIN] Opening two cameras…")
     cams = []
     target_count = min(2, len(cam_ids))
-    indices = list(range(target_count))
-    if target_count != len(cam_ids):
-        print(f"[WARN] SDK enumerated {len(cam_ids)} device(s) but only opening {target_count}.")
+    # Allow overriding camera selection to avoid built-in webcam
+    env_order = os.environ.get("CAM_INDEX_ORDER", "").strip()
+    if env_order:
+        try:
+            indices = [int(x.strip()) for x in env_order.split(",") if x.strip() != ""]
+        except Exception:
+            indices = list(range(target_count))
+        if len(indices) == 0:
+            indices = list(range(target_count))
+        print(f"[INFO] Using camera indices from CAM_INDEX_ORDER: {indices}")
+    else:
+        indices = list(range(target_count))
+        if target_count != len(cam_ids):
+            print(f"[WARN] SDK enumerated {len(cam_ids)} device(s) but only opening {target_count}.")
+        print(f"[INFO] Using default camera indices: {indices}. Set CAM_INDEX_ORDER (e.g., '1,2') to override.")
     for i in indices:
         cams.append(CamReader(i))
     if not cams:
