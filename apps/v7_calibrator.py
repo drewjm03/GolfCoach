@@ -18,6 +18,7 @@ CAPTURE_FPS = 120
 MAX_COMBINED_WIDTH = 1920
 FIRST_FRAME_RETRY_COUNT = 5
 WB_TOGGLE_DELAY_S = 0.075
+PRESERVE_NATIVE_RES = True  # if True, do not downscale combined preview; keep exact pixel size
 
 # Exposure/gain defaults
 USE_SDK_EXPOSURE = False
@@ -686,7 +687,15 @@ def main():
                               for _ in cams]
 
     win = "Stereo Calibrator"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    if PRESERVE_NATIVE_RES:
+        cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+        # Keep aspect ratio in case the OS resizes the window
+        try:
+            cv2.setWindowProperty(win, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
+        except Exception:
+            pass
+    else:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(win, on_mouse)
 
     try:
@@ -775,7 +784,7 @@ def main():
                 annotated[1] = cv2.resize(annotated[1], (int(w2 * target_h / h2), target_h))
             combined = cv2.hconcat(annotated)
             h,w = combined.shape[:2]
-            if w > MAX_COMBINED_WIDTH:
+            if (not PRESERVE_NATIVE_RES) and w > MAX_COMBINED_WIDTH:
                 scale = MAX_COMBINED_WIDTH / float(w)
                 combined = cv2.resize(combined, (MAX_COMBINED_WIDTH, int(round(h*scale))))
 
