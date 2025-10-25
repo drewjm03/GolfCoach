@@ -424,7 +424,37 @@ class CalibrationAccumulator:
     def _make_detector(self):
         dictionary = cv2.aruco.getPredefinedDictionary(APRIL_DICT)
         params = cv2.aruco.DetectorParameters()
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # Make detection more tolerant for smaller/blurrier tags
+        try:
+            params.minMarkerPerimeterRate = 0.02
+            params.maxMarkerPerimeterRate = 4.0
+        except Exception:
+            pass
+        try:
+            params.adaptiveThreshWinSizeMin = 3
+            params.adaptiveThreshWinSizeMax = 23
+            params.adaptiveThreshWinSizeStep = 4
+        except Exception:
+            pass
+        try:
+            params.adaptiveThreshConstant = 7
+        except Exception:
+            pass
+        try:
+            params.perspectiveRemoveIgnoredMarginPerCell = 0.2
+            params.perspectiveRemovePixelPerCell = 8
+        except Exception:
+            pass
+        try:
+            params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            params.cornerRefinementWinSize = 5
+            params.cornerRefinementMinAccuracy = 0.01
+        except Exception:
+            pass
+        try:
+            params.detectInvertedMarker = True
+        except Exception:
+            pass
         return cv2.aruco.ArucoDetector(dictionary, params)
 
     def _build_id_to_object(self):
