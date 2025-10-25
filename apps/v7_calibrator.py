@@ -651,6 +651,7 @@ class Button:
 
 
 def main():
+    global auto_exposure_on, current_exposure_step, current_gain
     print("[MAIN] Opening two cameras…")
     cams = []
     target_count = min(2, len(cam_ids))
