@@ -203,6 +203,13 @@ def probe_aruco_6x6(gray):
             results[name] = int(len(ids))
     return results
 
+def draw_ids(img, corners, ids, color=(0,255,255)):
+    if ids is None or len(ids) == 0: 
+        return
+    for c, i in zip(corners, ids):
+        c4 = c.reshape(4,2).astype(int)
+        p = c4.mean(axis=0).astype(int)
+        cv2.putText(img, str(int(i[0])), tuple(p), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 def max_exposure_us_for_fps(fps, safety_us=300):
     period_us = int(round(1_000_000 / max(1, int(fps))))
@@ -254,6 +261,25 @@ def set_auto_exposure_uvc(cap):
         if cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, v):
             return True
     return False
+
+def board_ids_safe(board):
+    """Return Nx1 int32 array of board IDs in a version-agnostic way."""
+    ids = getattr(board, "ids", None)
+    if ids is None:
+        # Some builds provide a getter
+        try:
+            ids = board.getIds()
+        except Exception:
+            ids = None
+    if ids is None:
+        # Fall back to sequential 0..N-1 based on number of markers
+        try:
+            N = len(board.getObjPoints())
+        except Exception:
+            N = 0
+        ids = np.arange(N, dtype=np.int32).reshape(-1, 1)
+    return np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+
 
 def set_white_balance_uvc(cap, kelvin=4500):
     cap.set(cv2.CAP_PROP_AUTO_WB, 0)
@@ -603,7 +629,7 @@ class CalibrationAccumulator:
         # GridBoard has .ids (Nx1) and .objPoints list length N with 4x3 points
         id_to_obj = {}
         try:
-            ids = self.board.ids.flatten().astype(int)
+            ids = board_ids_safe(self.board).flatten().astype(int)
             obj_points = self.board.getObjPoints()
             for idx, tag_id in enumerate(ids):
                 obj = np.array(obj_points[idx], dtype=np.float32).reshape(-1, 3)
@@ -892,6 +918,14 @@ def main():
     dictionary = cv2.aruco.getPredefinedDictionary(APRIL_DICT)
     # OpenCV >=4.7: use GridBoard class constructor with (markersX, markersY) tuple
     board = cv2.aruco.GridBoard((TAGS_X, TAGS_Y), TAG_SIZE_M, TAG_SEP_M, dictionary)
+    
+    print("[DBG] APRIL_DICT code:", APRIL_DICT)
+    print("[DBG] Grid size:", TAGS_X, "x", TAGS_Y, " -> markers:", len(board.getObjPoints()))
+    ids_dbg = board_ids_safe(board)
+    print("[DBG] First 20 board IDs:", ids_dbg.flatten()[:20].tolist())
+    print("[DBG] Tag size (m):", TAG_SIZE_M, "  Sep (m):", TAG_SEP_M, "  Sep/Size ratio:", TAG_SEP_M / TAG_SIZE_M)
+
+    
     acc = CalibrationAccumulator(board, image_size)
     print("[APRIL] Backend:", acc.get_backend_name())
     print("[APRIL] Families:", acc._apriltag_family_string())
@@ -1016,8 +1050,10 @@ def main():
                     c1, i1 = acc.detect(g1)
                     if c0:
                         cv2.aruco.drawDetectedMarkers(annotated[0], c0, i0)
+                        draw_ids(annotated[0], c0, i0, (0,255,255))
                     if c1:
                         cv2.aruco.drawDetectedMarkers(annotated[1], c1, i1)
+                        draw_ids(annotated[1], c1, i1, (0,255,255))
                     det_counts = (len(i0) if i0 is not None else 0, len(i1) if i1 is not None else 0)
                 except Exception:
                     pass
@@ -1071,7 +1107,7 @@ def main():
                 scale = MAX_COMBINED_WIDTH / float(w)
                 combined = cv2.resize(combined, (MAX_COMBINED_WIDTH, int(round(h*scale))))
 
-            PREVIEW_MIRROR = True
+            PREVIEW_MIRROR = False
             display_frames = [cv2.flip(img, 1) if PREVIEW_MIRROR else img for img in annotated]
             combined = cv2.vconcat(display_frames)
             cv2.imshow(win, combined)
