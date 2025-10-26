@@ -67,6 +67,7 @@ MIN_MARKERS_PER_VIEW = 8
 MIN_SAMPLES = 20
 TARGET_RMS_PX = 0.6
 RECALC_INTERVAL_S = 1.0
+CALIB_SAMPLE_PERIOD_S = 3.0  # only accumulate a new sample every N seconds
 
 SENSOR_ROTATE_180 = False
 
@@ -934,6 +935,7 @@ def main():
     best_stereo_rms = float("inf")
     last_recalc = 0.0
     calibrated = False
+    last_sample_t = 0.0
 
     # Pose
     pose_on = False
@@ -953,6 +955,10 @@ def main():
                 state["calibrating"] = not state["calibrating"]
                 btn_cal.active = state["calibrating"]
                 print(f"[UI] Calibrating -> {state['calibrating']}")
+                if state["calibrating"]:
+                    # reset sampling timer so we capture a sample immediately
+                    nonlocal last_sample_t
+                    last_sample_t = 0.0
             elif btn_pose.hit(x, y):
                 nonlocal pose_on, estimators
                 pose_on = not pose_on
@@ -994,9 +1000,10 @@ def main():
                 estimators[0].submit(ts0, f0)
                 estimators[1].submit(ts1, f1)
 
-            # Calibration accumulation
-            if state["calibrating"] and (time.perf_counter() - last_recalc) > 0.05:
+            # Calibration accumulation (sample once every CALIB_SAMPLE_PERIOD_S)
+            if state["calibrating"] and (now - last_sample_t) >= CALIB_SAMPLE_PERIOD_S:
                 added = acc.accumulate_pair(g0, g1)
+                last_sample_t = now
                 if added:
                     print(f"[CAL] samples: mono0={len(acc.corners0)} mono1={len(acc.corners1)} stereo={len(acc.stereo_samples)}")
 
@@ -1118,6 +1125,9 @@ def main():
                 state["calibrating"] = not state["calibrating"]
                 btn_cal.active = state["calibrating"]
                 print(f"[KEY] Calibrating -> {state['calibrating']}")
+                if state["calibrating"]:
+                    # reset sampling timer for immediate sample
+                    last_sample_t = 0.0
             elif key == ord('p'):
                 pose_on = not pose_on
                 print(f"[KEY] Pose toggle -> {pose_on}")
