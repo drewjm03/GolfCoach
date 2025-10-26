@@ -11,7 +11,7 @@ print(cv2.__version__)
 print("ArucoDetector?", hasattr(cv2.aruco, "ArucoDetector"))
 print("AprilTag in build?", "AprilTag" in cv2.getBuildInformation())
 
-
+print("pupil_apriltags available?", HAVE_PUPIL)
 # Optional sound on Windows
 try:
     import winsound
@@ -25,7 +25,7 @@ except Exception:
         pass
 
 # ---------- Tunable constants ----------
-CAPTURE_FPS = 120
+CAPTURE_FPS = 60
 MAX_COMBINED_WIDTH = 1920
 FIRST_FRAME_RETRY_COUNT = 5
 WB_TOGGLE_DELAY_S = 0.075
@@ -56,11 +56,19 @@ TAGS_Y = 5                # number of tags vertically
 TAG_SIZE_M = 0.075         # tag black square size in meters
 TAG_SEP_M = 0.01875          # white gap between tags in meters
 
+# AprilTag quality / gating
+MAX_HAMMING = 0            # only perfect decodes
+MIN_DECISION_MARGIN = 30   # 35–45 is good for 16h5; raise if you still see clutter
+MIN_SIDE_PX = 32         # ignore tiny tags; adjust for your resolution
+USE_ID_GATING = False 
+
 # Calibration parameters/criteria
 MIN_MARKERS_PER_VIEW = 8
 MIN_SAMPLES = 20
 TARGET_RMS_PX = 0.6
 RECALC_INTERVAL_S = 1.0
+
+SENSOR_ROTATE_180 = False
 
 # ---------- Optional: MediaPipe (BlazePose) import ----------
 HAVE_MP, MP_IMPORT_ERR = False, ""
@@ -129,6 +137,72 @@ for i, b in enumerate(wbufs): Paths[i] = ctypes.cast(b, WSTR)
 assert dll.GetDevicePaths(Paths), "GetDevicePaths failed"
 cam_ids = [b.value for b in wbufs]
 for i, pid in enumerate(cam_ids): print(f"[INFO] SDK device {i} instance path: {pid}")
+
+def probe_tag36h11(gray):
+    """Return sorted list of tag36h11 IDs seen with quality gates applied."""
+    try:
+        from pupil_apriltags import Detector as _PD
+    except Exception:
+        return []
+    det = _PD(families="tag36h11", nthreads=2, quad_decimate=1.0,
+              quad_sigma=0.0, refine_edges=True, decode_sharpening=0.25)
+    dets = det.detect(gray, estimate_tag_pose=False) or det.detect(255 - gray, estimate_tag_pose=False)
+    ids = []
+    for d in (dets or []):
+        if getattr(d, "hamming", 0) > MAX_HAMMING: 
+            continue
+        if getattr(d, "decision_margin", 0.0) < MIN_DECISION_MARGIN:
+            continue
+        # size gate
+        c = np.array(d.corners, dtype=np.float32).reshape(4, 2)
+        side = float(sum(np.linalg.norm(c[(i+1) % 4] - c[i]) for i in range(4)) / 4.0)
+        if side < MIN_SIDE_PX:
+            continue
+        ids.append(int(d.tag_id))
+    return sorted(set(ids))
+
+def smoke_test_tag36h11(gray):
+    """Very permissive single-frame test for 36h11; returns sorted IDs seen."""
+    try:
+        from pupil_apriltags import Detector as _PD
+    except Exception:
+        return []
+    det = _PD(families="tag36h11", nthreads=2,
+              quad_decimate=1.0, quad_sigma=0.0,
+              refine_edges=True, decode_sharpening=0.25)
+    dets = det.detect(gray, estimate_tag_pose=False) or det.detect(255 - gray, estimate_tag_pose=False)
+    ids = []
+    for d in (dets or []):
+        # very lax gates: allow a little error, low margin, small tags
+        if getattr(d, "hamming", 0) > 2:      # allow a bit of error
+            continue
+        if getattr(d, "decision_margin", 0.0) < 15:
+            continue
+        c = np.array(d.corners, dtype=np.float32).reshape(4, 2)
+        side = float(sum(np.linalg.norm(c[(i+1)%4] - c[i]) for i in range(4)) / 4.0)
+        if side < 16:                         # allow smaller tags
+            continue
+        ids.append(int(d.tag_id))
+    return sorted(set(ids))
+
+def probe_aruco_6x6(gray):
+    """Return {'DICT_6X6_50': n, 'DICT_6X6_100': n, ...} that hit on this frame."""
+    D = cv2.aruco
+    results = {}
+    for name, code in [("DICT_6X6_50", D.DICT_6X6_50),
+                       ("DICT_6X6_100", D.DICT_6X6_100),
+                       ("DICT_6X6_250", D.DICT_6X6_250),
+                       ("DICT_6X6_1000", D.DICT_6X6_1000)]:
+        dic = D.getPredefinedDictionary(code)
+        params = D.DetectorParameters()
+        try: params.detectInvertedMarker = True
+        except: pass
+        det = D.ArucoDetector(dic, params)
+        corners, ids, _ = det.detectMarkers(gray)
+        if ids is not None and len(ids) > 0:
+            results[name] = int(len(ids))
+    return results
+
 
 def max_exposure_us_for_fps(fps, safety_us=300):
     period_us = int(round(1_000_000 / max(1, int(fps))))
@@ -268,38 +342,54 @@ class CamReader:
         self.ok = True
         self.fps = 0.0
         self._times = []
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def _loop(self):
         while self.ok:
             ok, f = self.cap.read()
             if not ok:
-                time.sleep(0.002); continue
-            try:
-                f = cv2.flip(f, 0)
-            except Exception:
-                pass
+                time.sleep(0.002)
+                continue
+
+            # NO mirroring here; optional safe rotation only
+            if SENSOR_ROTATE_180:
+                f = cv2.rotate(f, cv2.ROTATE_180)  # or: f = cv2.flip(f, -1)
+
             ts = time.perf_counter()
-            if self.q.full():
-                try: self.q.get_nowait()
-                except: pass
+
+            # single-element queue: keep only latest frame
+            try:
+                while self.q.qsize() >= 1:
+                    self.q.get_nowait()
+            except queue.Empty:
+                pass
             self.q.put((ts, f))
+
+            # fps estimate over last ~30 timestamps
             self._times.append(ts)
-            if len(self._times) > 30: self._times.pop(0)
+            if len(self._times) > 30:
+                self._times.pop(0)
             if len(self._times) >= 2:
                 span = self._times[-1] - self._times[0]
-                if span > 0: self.fps = (len(self._times)-1)/span
+                if span > 0:
+                    self.fps = (len(self._times) - 1) / span
 
     def latest(self, timeout=2.0):
         ts, f = self.q.get(timeout=timeout)
-        while not self.q.empty():
-            ts, f = self.q.get_nowait()
+        # drain any backlog so caller gets the freshest frame
+        while True:
+            try:
+                ts, f = self.q.get_nowait()
+            except queue.Empty:
+                break
         return ts, f
 
     def release(self):
         self.ok = False
         time.sleep(0.05)
         self.cap.release()
+
 
 # ---------- Pose Estimator worker (optional) ----------
 class PoseEstimator:
@@ -428,15 +518,22 @@ class CalibrationAccumulator:
         self.detector = self._make_detector()
         # Prefer pupil-apriltags when available or when OpenCV build lacks AprilTag
         self._pupil = None
+        self.backend_name = "OpenCV ArUco"
         if HAVE_PUPIL:
-            self._pupil = PupilDetector(
-                families=self._apriltag_family_string(),
-                nthreads=2,
-                quad_decimate=1.0,
-                quad_sigma=0.0,
-                refine_edges=True,
-                decode_sharpening=0.25,
-            )
+            try:
+                self._pupil = PupilDetector(
+                    families=self._apriltag_family_string(),
+                    nthreads=2,
+                    quad_decimate=1.0,
+                    quad_sigma=0.0,
+                    refine_edges=True,
+                    decode_sharpening=0.25,
+                )
+                self.backend_name = "pupil-apriltags"
+            except Exception as e:
+                print("[APRIL] pupil-apriltags init failed:", e)
+        print(f"[APRIL] Detector backend: {self.backend_name}")
+
         # Per-cam accumulators for mono calibration
         self.corners0, self.ids0, self.counter0 = [], [], []
         self.corners1, self.ids1, self.counter1 = [], [], []
@@ -447,6 +544,9 @@ class CalibrationAccumulator:
         self.K1 = None; self.D1 = None; self.rms1 = None
         # id -> objCorners lookup
         self.id_to_obj = self._build_id_to_object()
+
+    def get_backend_name(self):
+        return getattr(self, "backend_name", "OpenCV ArUco")
 
     def _make_detector(self):
         dictionary = cv2.aruco.getPredefinedDictionary(APRIL_DICT)
@@ -521,31 +621,73 @@ class CalibrationAccumulator:
                 id_to_obj = {}
         return id_to_obj
 
+    @staticmethod
+    def _avg_side_px(corners_1x4x2):
+        c = corners_1x4x2.reshape(4, 2).astype(np.float32)
+        return float(sum(np.linalg.norm(c[(i+1) % 4] - c[i]) for i in range(4)) / 4.0)
+
     def detect(self, gray):
-        # Prefer pupil-apriltags if available
+        # Gate to only board IDs if (and only if) you constructed the board with real printed IDs
+        allowed_ids = set(self.id_to_obj.keys()) if (self.id_to_obj and USE_ID_GATING) else None
+
+        # 1) pupil-apriltags first (normal then inverted)
         if self._pupil is not None:
-            dets = self._pupil.detect(gray, estimate_tag_pose=False)
-            if not dets:
-                return [], None
-            corners = []
-            ids = []
-            for d in dets:
-                c = np.array(d.corners, dtype=np.float32).reshape(1, 4, 2)
-                corners.append(c)
-                ids.append([int(d.tag_id)])
-            ids = np.array(ids, dtype=np.int32)
-            for c in corners:
-                cv2.cornerSubPix(gray, c.squeeze(0), (3,3), (-1,-1),
-                                 (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 10, 0.01))
-            return corners, ids
-        # Fallback to OpenCV aruco apriltag integration
+            for img in (gray, 255 - gray):
+                try:
+                    dets = self._pupil.detect(img, estimate_tag_pose=False)
+                except Exception:
+                    dets = []
+                corners, ids = [], []
+                for d in (dets or []):
+                    tid = int(d.tag_id)
+                    if getattr(d, "hamming", 0) > MAX_HAMMING: 
+                        continue
+                    if getattr(d, "decision_margin", 0.0) < MIN_DECISION_MARGIN:
+                        continue
+                    c = np.array(d.corners, dtype=np.float32).reshape(1, 4, 2)
+                    if _avg_side_px(c) < MIN_SIDE_PX:
+                        continue
+                    if allowed_ids is not None and tid not in allowed_ids:
+                        continue
+                    corners.append(c); ids.append([tid])
+                if ids:
+                    ids = np.array(ids, dtype=np.int32)
+                    try:
+                        for c in corners:
+                            cv2.cornerSubPix(gray, c.squeeze(0), (3,3), (-1,-1),
+                                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 10, 0.01))
+                    except Exception:
+                        pass
+                    return corners, ids
+            # fall through if none survived
+
+        # 2) OpenCV fallback (works if your build has AprilTag or for ArUco)
         corners, ids, _ = self.detector.detectMarkers(gray)
         if ids is None or len(corners) == 0:
             return [], None
-        for c in corners:
-            cv2.cornerSubPix(gray, c.squeeze(1), (3,3), (-1,-1),
-                             (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 10, 0.01))
-        return corners, ids.astype(int)
+
+        filt_c, filt_i = [], []
+        for c, i in zip(corners, ids):
+            tid = int(i[0])
+            if self._avg_side_px(c) < MIN_SIDE_PX:
+                continue
+            if allowed_ids is not None and tid not in allowed_ids:
+                continue
+            filt_c.append(c); filt_i.append([tid])
+
+        if not filt_i:
+            return [], None
+
+        try:
+            for c in filt_c:
+                cv2.cornerSubPix(gray, c.squeeze(1), (3,3), (-1,-1),
+                    (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 10, 0.01))
+        except Exception:
+            pass
+
+        return filt_c, np.array(filt_i, dtype=np.int32)
+
+
 
     def _accumulate_single(self, cam_idx, corners, ids):
         if corners is None or ids is None or len(corners) < MIN_MARKERS_PER_VIEW:
@@ -751,6 +893,9 @@ def main():
     # OpenCV >=4.7: use GridBoard class constructor with (markersX, markersY) tuple
     board = cv2.aruco.GridBoard((TAGS_X, TAGS_Y), TAG_SIZE_M, TAG_SEP_M, dictionary)
     acc = CalibrationAccumulator(board, image_size)
+    print("[APRIL] Backend:", acc.get_backend_name())
+    print("[APRIL] Families:", acc._apriltag_family_string())
+
     results = CalibrationResults()
     best_stereo_rms = float("inf")
     last_recalc = 0.0
@@ -792,6 +937,8 @@ def main():
         pass
     cv2.setMouseCallback(win, on_mouse)
 
+    next_probe_t = 0.0
+
     try:
         while True:
             try:
@@ -803,6 +950,11 @@ def main():
 
             frames = [f0, f1]
 
+            g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
+            g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+
+            now = time.perf_counter()
+
             # Pose submission
             if HAVE_MP and pose_on:
                 estimators[0].submit(ts0, f0)
@@ -810,13 +962,23 @@ def main():
 
             # Calibration accumulation
             if state["calibrating"] and (time.perf_counter() - last_recalc) > 0.05:
-                g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
-                g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
                 added = acc.accumulate_pair(g0, g1)
                 if added:
                     print(f"[CAL] samples: mono0={len(acc.corners0)} mono1={len(acc.corners1)} stereo={len(acc.stereo_samples)}")
 
-            now = time.perf_counter()
+            
+            if state["calibrating"] and now >= next_probe_t:
+                ids0 = smoke_test_tag36h11(g0)
+                ids1 = smoke_test_tag36h11(g1)
+                aru0 = probe_aruco_6x6(g0)
+                aru1 = probe_aruco_6x6(g1)
+                if aru0 or aru1:
+                    print("[PROBE ArUco 6x6] cam0:", aru0, " cam1:", aru1)
+
+                print("[SMOKE 36h11] cam0:", ids0, " cam1:", ids1)
+                next_probe_t = now + 1.0
+
+
             if state["calibrating"] and (now - last_recalc) >= RECALC_INTERVAL_S and acc.enough_samples():
                 last_recalc = now
                 changed = acc.calibrate_if_possible(results)
@@ -868,6 +1030,8 @@ def main():
             if state["calibrating"]:
                 status_lines.append(f"Calibrating… n0={len(acc.corners0)} n1={len(acc.corners1)} ns={len(acc.stereo_samples)}")
                 status_lines.append(f"Detected tags: cam0={det_counts[0]} cam1={det_counts[1]}")
+            
+            status_lines.append(f"Detector: {acc.get_backend_name()}")
             # Exposure/Gain readout
             if auto_exposure_on:
                 status_lines.append("Exposure: Auto (UVC)")
@@ -907,6 +1071,9 @@ def main():
                 scale = MAX_COMBINED_WIDTH / float(w)
                 combined = cv2.resize(combined, (MAX_COMBINED_WIDTH, int(round(h*scale))))
 
+            PREVIEW_MIRROR = True
+            display_frames = [cv2.flip(img, 1) if PREVIEW_MIRROR else img for img in annotated]
+            combined = cv2.vconcat(display_frames)
             cv2.imshow(win, combined)
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q'):
