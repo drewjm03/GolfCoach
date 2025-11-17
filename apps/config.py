@@ -23,8 +23,8 @@ GAIN_DELTA = 1.0
 
 # AprilTag grid board configuration
 APRIL_DICT = cv2.aruco.DICT_APRILTAG_36h11
-TAGS_X = 8                # number of tags horizontally
-TAGS_Y = 5                # number of tags vertically
+TAGS_X = 7                # number of tags horizontally (columns)
+TAGS_Y = 5                # number of tags vertically (rows)
 TAG_SIZE_M = 0.075        # tag black square size in meters
 TAG_SEP_M = 0.01875       # white gap between tags in meters
 

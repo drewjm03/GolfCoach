@@ -1,6 +1,11 @@
 import ctypes, cv2, time, threading, queue, os, sys, json
 import numpy as np
 try:
+    import requests, pickle
+    _HAVE_REQUESTS = True
+except Exception:
+    _HAVE_REQUESTS = False
+try:
     from pupil_apriltags import Detector as PupilDetector
     HAVE_PUPIL = True
 except Exception:
@@ -52,7 +57,7 @@ current_gain = None
 
 # AprilTag grid board configuration 
 APRIL_DICT = cv2.aruco.DICT_APRILTAG_36h11
-TAGS_X = 8                # number of tags horizontally
+TAGS_X = 7                # number of tags horizontally
 TAGS_Y = 5                # number of tags vertically
 TAG_SIZE_M = 0.075         # tag black square size in meters
 TAG_SEP_M = 0.01875          # white gap between tags in meters
@@ -247,6 +252,123 @@ def draw_ids(img, corners, ids, color=(0,255,255)):
         c4 = c.reshape(4,2).astype(int)
         p = c4.mean(axis=0).astype(int)
         cv2.putText(img, str(int(i[0])), tuple(p), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+def try_load_harvard_coarse_board(dictionary):
+    # Local override via env var
+    local_override = os.environ.get("APRIL_BOARDS_PICKLE", "").strip()
+    if local_override:
+        try:
+            with open(os.path.abspath(local_override), "rb") as f:
+                data = pickle.loads(f.read())
+            bd = data.get('at_coarseboard', None)
+            # If the whole pickle is already a Board-like object, accept it
+            if hasattr(data, "getObjPoints") and (hasattr(data, "ids") or hasattr(data, "getIds")):
+                return data
+            # Otherwise parse known structures
+            board = _parse_board_from_data(dictionary, bd if bd is not None else data)
+            if board is not None:
+                print(f"[BOARD] Loaded Harvard board from local file: {local_override}")
+                return board
+            else:
+                keys = list(data.keys()) if isinstance(data, dict) else "N/A"
+                print(f"[BOARD] Local pickle present but no usable board found. Available keys: {keys}")
+        except Exception as e:
+            print(f"[BOARD] Failed to read local pickle '{local_override}': {e}")
+        # If a local override was provided, do NOT attempt network fallback
+        return None
+    if not _HAVE_REQUESTS:
+        return None
+    urls = [
+        "https://github.com/Harvard-CS283/pset-data/raw/f1a90573ae88cd530a3df3cd0cea71aa2363b1b3/april/AprilBoards.pickle",
+        "https://raw.githubusercontent.com/Harvard-CS283/pset-data/f1a90573ae88cd530a3df3cd0cea71aa2363b1b3/april/AprilBoards.pickle",
+    ]
+    for url in urls:
+        for attempt in range(2):
+            try:
+                resp = requests.get(url, timeout=15, allow_redirects=True, headers={"User-Agent": "GolfCoach/1.0"})
+                if resp.status_code != 200:
+                    print(f"[BOARD] HTTP {resp.status_code} fetching board from {url}")
+                    continue
+                data = pickle.loads(resp.content)
+                bd = data.get('at_coarseboard', None)
+                board = _parse_board_from_data(dictionary, bd)
+                if board is not None:
+                    print(f"[BOARD] Loaded Harvard board from: {url}")
+                    return board
+                else:
+                    print(f"[BOARD] Pickle at {url} missing/invalid 'at_coarseboard'")
+            except Exception as e:
+                print(f"[BOARD] Fetch attempt {attempt+1} failed for {url}: {e}")
+                time.sleep(0.5)
+    return None
+
+def _parse_board_from_data(dictionary, bd):
+    try:
+        if bd is None:
+            return None
+        # If already a Board-like object, return as-is
+        if hasattr(bd, "getObjPoints") and (hasattr(bd, "ids") or hasattr(bd, "getIds")):
+            return bd
+        obj_points = []
+        ids_list = []
+        if isinstance(bd, dict) and 'ids' in bd:
+            ids_raw = list(bd.get('ids', []))
+            corners_raw = bd.get('objPoints', bd.get('corners', []))
+            for tid, pts in zip(ids_raw, corners_raw):
+                P = np.array(pts, dtype=np.float32).reshape(-1, 3 if np.array(pts).shape[-1] == 3 else 2)
+                if P.shape[1] == 2:
+                    P = np.hstack([P, np.zeros((P.shape[0], 1), dtype=np.float32)])
+                if P.shape[0] == 4:
+                    obj_points.append(P.reshape(4, 3))
+                    ids_list.append(int(tid))
+        elif isinstance(bd, (list, tuple)) and len(bd) > 0:
+            for item in bd:
+                if isinstance(item, dict):
+                    # Case A: dict with 'id' and 'corners'/'objPoints'
+                    if 'id' in item and ('corners' in item or 'objPoints' in item):
+                        tid = int(item['id'])
+                        pts = item.get('objPoints', item.get('corners'))
+                        P = np.array(pts, dtype=np.float32).reshape(-1, 3 if np.array(pts).shape[-1] == 3 else 2)
+                        if P.shape[1] == 2:
+                            P = np.hstack([P, np.zeros((P.shape[0], 1), dtype=np.float32)])
+                        if P.shape[0] == 4:
+                            obj_points.append(P.reshape(4, 3))
+                            ids_list.append(tid)
+                        continue
+                    # Case B: dict with 'tag_id' and 'center' (Harvard format)
+                    if 'tag_id' in item and 'center' in item:
+                        tid = int(item['tag_id'])
+                        c = np.array(item['center'], dtype=np.float32).reshape(-1)
+                        if c.size == 2:
+                            cx, cy = float(c[0]), float(c[1]); cz = 0.0
+                        else:
+                            cx, cy, cz = float(c[0]), float(c[1]), float(c[2])
+                        half = float(TAG_SIZE_M) * 0.5
+                        pts3 = np.array([
+                            [cx - half, cy - half, cz],
+                            [cx + half, cy - half, cz],
+                            [cx + half, cy + half, cz],
+                            [cx - half, cy + half, cz],
+                        ], dtype=np.float32)
+                        obj_points.append(pts3.reshape(4, 3))
+                        ids_list.append(tid)
+                        continue
+                # Unsupported element
+        else:
+            return None
+        if not obj_points or not ids_list:
+            return None
+        ids_arr = np.array(ids_list, dtype=np.int32).reshape(-1, 1)
+        try:
+            board = cv2.aruco.Board(obj_points, dictionary, ids_arr)
+        except Exception:
+            try:
+                board = cv2.aruco.Board_create(obj_points, dictionary, ids_arr)
+            except Exception:
+                board = None
+        return board
+    except Exception:
+        return None
 
 def max_exposure_us_for_fps(fps, safety_us=300):
     period_us = int(round(1_000_000 / max(1, int(fps))))
@@ -825,8 +947,16 @@ class CalibrationAccumulator:
         all_counter = [len(ids_img) for ids_img in ids]
         try:
             rms, K, D, _, _ = cv2.aruco.calibrateCameraAruco(
-                all_corners, np.concatenate(all_ids, axis=0), np.array(all_counter, dtype=np.int32),
-                self.board, self.image_size, None, None)
+                all_corners,
+                np.concatenate(all_ids, axis=0),
+                np.array(all_counter, dtype=np.int32),
+                self.board,
+                self.image_size,
+                None,
+                None,
+                flags=cv2.CALIB_RATIONAL_MODEL,
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-7),
+            )
         except Exception:
             # Fallback to standard calibrateCamera using concatenated marker corners as points
             obj_pts_list = []
@@ -848,8 +978,16 @@ class CalibrationAccumulator:
             if len(obj_pts_list) == 0:
                 return None, None, None
             K = np.eye(3, dtype=np.float64)
-            D = np.zeros((5,1), dtype=np.float64)
-            rms, K, D, _, _ = cv2.calibrateCamera(obj_pts_list, img_pts_list, self.image_size, K, D)
+            D = np.zeros((8,1), dtype=np.float64)  # allow rational model (k1..k6, p1, p2)
+            rms, K, D, _, _ = cv2.calibrateCamera(
+                obj_pts_list,
+                img_pts_list,
+                self.image_size,
+                K,
+                D,
+                flags=cv2.CALIB_RATIONAL_MODEL,
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-7),
+            )
         return rms, K, D
 
     def calibrate_if_possible(self, results: CalibrationResults):
@@ -956,10 +1094,28 @@ def main():
     H, W = f0.shape[0], f0.shape[1]
     image_size = (W, H)
 
-    # AprilTag GridBoard
+    # AprilTag Board: prefer Harvard CS283 coarse board if available, else GridBoard
     dictionary = cv2.aruco.getPredefinedDictionary(APRIL_DICT)
-    # OpenCV >=4.7: use GridBoard class constructor with (markersX, markersY) tuple
-    board = cv2.aruco.GridBoard((TAGS_X, TAGS_Y), TAG_SIZE_M, TAG_SEP_M, dictionary)
+    # Board selection via env var BOARD_SOURCE
+    board_source = os.environ.get("BOARD_SOURCE", "harvard").strip().lower()
+    if board_source == "grid8x5":
+        # Construct 8x5 GridBoard, 0 at bottom-left, 39 at top-right, tag size 0.075m, sep 0.01875m
+        TAGS_X = 8
+        TAGS_Y = 5
+        TAG_SIZE_M_LOCAL = 0.075
+        TAG_SEP_M_LOCAL = 0.01875
+        ids_grid = np.arange(TAGS_X * TAGS_Y, dtype=np.int32).reshape(TAGS_Y, TAGS_X)
+        ids_grid = np.flipud(ids_grid)
+        ids = ids_grid.reshape(-1, 1).astype(np.int32)
+        board = cv2.aruco.GridBoard((TAGS_X, TAGS_Y), TAG_SIZE_M_LOCAL, TAG_SEP_M_LOCAL, dictionary, ids)
+        print("[BOARD] Using GridBoard 8x5 (0 bottom-left -> 39 top-right), tag=0.075m sep=0.01875m")
+    else:
+        hb = try_load_harvard_coarse_board(dictionary)
+        if hb is None:
+            print("[BOARD] ERROR: Failed to load Harvard CS283 at_coarseboard from GitHub or local override.")
+            return
+        board = hb
+        print("[BOARD] Using Harvard CS283 at_coarseboard (required)")
     
     print("[DBG] APRIL_DICT code:", APRIL_DICT)
     print("[DBG] Grid size:", TAGS_X, "x", TAGS_Y, " -> markers:", len(board.getObjPoints()))

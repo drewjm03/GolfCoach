@@ -1,0 +1,12 @@
+{
+  "image_size": [
+    1280,
+    720
+  ],
+  "APRIL_DICT": 20,
+  "TAGS_X": 7,
+  "TAGS_Y": 5,
+  "TAG_SIZE_M": 0.075,
+  "TAG_SEP_M": 0.01875,
+  "model": "fisheye_equidistant"
+}
