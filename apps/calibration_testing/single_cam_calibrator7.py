@@ -36,6 +36,8 @@ MAX_VIEW_RMS_PX = 5.0  # if > 0, drop views above this RMS and recalibrate once
 # ---------- helpers ----------
 _APRIL_LOCAL_PICKLE = None  # optional local override set in main() or via env
 _BOARD_SOURCE = "harvard"   # 'harvard' or 'grid8x5' (set in main())
+_HARVARD_TAG_SIZE_M = None  # optional tag size override (meters)
+_HARVARD_TAG_SPACING_M = None  # optional tag spacing (meters; informational)
 
 def _make_board():
     dictionary = cv2.aruco.getPredefinedDictionary(config.APRIL_DICT)
@@ -68,7 +70,8 @@ def _load_harvard_coarse_board(dictionary):
             path = os.path.abspath(local_override)
             with open(path, "rb") as f:
                 data = pickle.loads(f.read())
-            board = _parse_board_pickle(dictionary, data)
+            tag_size_m = _harvard_tag_size_from_data_or_env(data)
+            board = _parse_board_pickle(dictionary, data, tag_size_m=tag_size_m)
             if board is not None:
                 print(f"[BOARD] Loaded Harvard board from local file: {path}")
                 return board
@@ -95,7 +98,8 @@ def _load_harvard_coarse_board(dictionary):
                     print(f"[BOARD] HTTP {resp.status_code} fetching board from {url}")
                     continue
                 data = pickle.loads(resp.content)
-                board = _parse_board_pickle(dictionary, data)
+                tag_size_m = _harvard_tag_size_from_data_or_env(data)
+                board = _parse_board_pickle(dictionary, data, tag_size_m=tag_size_m)
                 if board is not None:
                     print(f"[BOARD] Loaded Harvard board from: {url}")
                     return board
@@ -106,7 +110,37 @@ def _load_harvard_coarse_board(dictionary):
                 time.sleep(0.5)
     return None
 
-def _parse_board_pickle(dictionary, data):
+def _harvard_tag_size_from_data_or_env(data):
+    """Return tag size (meters) from CLI/env or from pickle metadata if present."""
+    # CLI/global override
+    if _HARVARD_TAG_SIZE_M is not None:
+        try:
+            return float(_HARVARD_TAG_SIZE_M)
+        except Exception:
+            pass
+    # ENV override
+    env = os.environ.get("HARVARD_TAG_SIZE_M", "").strip()
+    if env:
+        try:
+            return float(env)
+        except Exception:
+            pass
+    # Try from pickle metadata
+    if isinstance(data, dict):
+        for k in ("tag_size", "tag_side", "tag_width", "april_tag_side", "tag_length", "marker_length"):
+            v = data.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        for pk in ("params", "metadata", "board_params"):
+            sub = data.get(pk)
+            if isinstance(sub, dict):
+                for k in ("tag_size", "tag_side", "tag_width", "april_tag_side", "tag_length", "marker_length"):
+                    v = sub.get(k)
+                    if isinstance(v, (int, float)):
+                        return float(v)
+    return None
+
+def _parse_board_pickle(dictionary, data, tag_size_m=None):
     try:
         # If data itself is already a cv2.aruco.Board-like object, return as-is
         if hasattr(data, "getObjPoints") and (hasattr(data, "ids") or hasattr(data, "getIds")):
@@ -150,6 +184,32 @@ def _parse_board_pickle(dictionary, data):
                     obj_points.append(P.reshape(4, 3))
                     ids_list.append(int(tid))
         elif isinstance(board_data, (list, tuple)) and len(board_data) > 0:
+            # Pre-collect centers if present to optionally infer unit scale using tag size + spacing
+            centers_units = []
+            ids_units = []
+            for item in board_data:
+                if isinstance(item, dict) and 'tag_id' in item and 'center' in item:
+                    c = np.array(item['center'], dtype=np.float32).reshape(-1)
+                    centers_units.append(c[:2].astype(np.float32))
+                    ids_units.append(int(item['tag_id']))
+            center_scale = None
+            # Only infer scale when BOTH tag size and spacing are provided
+            if centers_units and (tag_size_m is not None) and (_HARVARD_TAG_SPACING_M is not None):
+                desired_cc_m = float(tag_size_m) + float(_HARVARD_TAG_SPACING_M)
+                if desired_cc_m > 0:
+                    # Robust nearest neighbor distance in units
+                    C = np.vstack(centers_units)  # N x 2
+                    dists = []
+                    for i in range(C.shape[0]):
+                        di = np.hypot(C[i,0]-C[:,0], C[i,1]-C[:,1])
+                        di = di[di > 1e-6]
+                        if di.size > 0:
+                            dists.append(np.min(di))
+                    if dists:
+                        nn_units = float(np.median(np.array(dists, dtype=np.float32)))
+                        if nn_units > 0:
+                            center_scale = desired_cc_m / nn_units
+                            print(f"[BOARD] Harvard center scale inferred: {center_scale:.6f} m/unit (nn={nn_units:.6f} units, cc={desired_cc_m:.6f} m)")
             for item in board_data:
                 if isinstance(item, dict):
                     # Case A: dict with 'id' and 'corners'/'objPoints'
@@ -165,14 +225,18 @@ def _parse_board_pickle(dictionary, data):
                         continue
                     # Case B: dict with 'tag_id' and 'center' (Harvard format)
                     if 'tag_id' in item and 'center' in item:
+                        if tag_size_m is None:
+                            raise RuntimeError("[BOARD] Harvard centers found but tag size unknown. Provide --harvard-tag-size-m or HARVARD_TAG_SIZE_M env.")
                         tid = int(item['tag_id'])
                         c = np.array(item['center'], dtype=np.float32).reshape(-1)
+                        if center_scale is not None:
+                            c = c * float(center_scale)
                         # center can be (x,y) or (x,y,z); assume z=0 if 2D
                         if c.size == 2:
                             cx, cy = float(c[0]), float(c[1]); cz = 0.0
                         else:
                             cx, cy, cz = float(c[0]), float(c[1]), float(c[2])
-                        half = float(getattr(config, "TAG_SIZE_M", 0.075)) * 0.5
+                        half = float(tag_size_m) * 0.5
                         # Construct square corners around center in board plane
                         pts3 = np.array([
                             [cx - half, cy - half, cz],
@@ -276,19 +340,54 @@ def calibrate_pinhole_full(obj_list, img_list, image_size, K_seed=None):
     return float(rms), K, D, rvecs, tvecs
 
 # ---------- diagnostics ----------
-def _save_diag_pinhole(path_png, frame_bgr, corners, ids, acc, K, D, rvec, tvec, r_cyan=8, r_mag=3):
+def _save_diag_pinhole(path_png, frame_bgr, corners, ids, acc, K, D, rvec, tvec,
+                       r_cyan=8, r_mag=3, draw_corners=True, draw_proj_corners=True):
     img = frame_bgr.copy()
+    # Optional: accumulate for per-view RMS
+    obj_all = []
+    img_all = []
     for c, iv in zip(corners, ids):
         tid = int(iv[0])
         if tid not in acc.id_to_obj: continue
-        obj4 = acc.id_to_obj[tid].astype(np.float64).reshape(-1,1,3)  # Nx1x3
-        proj,_ = cv2.projectPoints(obj4, rvec, tvec, K, D)
-        det_center = c.reshape(4,2).astype(np.float32).mean(axis=0)
-        proj_center = proj.reshape(-1,2).mean(axis=0)
-        cv2.circle(img, tuple(np.int32(det_center)), int(r_cyan), (255,255,0), -1)  # cyan larger
-        cv2.circle(img, tuple(np.int32(proj_center)), int(r_mag), (255,0,255), -1)  # magenta smaller
-        cv2.line(img, tuple(np.int32(det_center)), tuple(np.int32(proj_center)), (0,180,255), 1)
-    cv2.putText(img, "Cyan=detected centers, Magenta=reprojected centers",
+        obj4 = acc.id_to_obj[tid].astype(np.float64).reshape(-1,1,3)  # 4x1x3
+        proj,_ = cv2.projectPoints(obj4, rvec, tvec, K, D)            # 4x1x2
+        det_corners = c.reshape(4,2).astype(np.float32)               # 4x2
+        proj_corners = proj.reshape(-1,2)                             # 4x2
+        det_center = det_corners.mean(axis=0)
+        proj_center = proj_corners.mean(axis=0)
+        cv2.circle(img, tuple(np.int32(det_center)), int(r_cyan), (255,255,0), -1)  # cyan (detected center)
+        # projected center in black for contrast
+        cv2.circle(img, tuple(np.int32(proj_center)), max(3, int(r_mag+1)), (0,0,0), -1)  # black (projected center)
+        if draw_corners:
+            p_ctr = tuple(np.int32(proj_center))
+            for k in range(4):
+                p_det = tuple(np.int32(det_corners[k]))
+                # detected corner (cyan)
+                cv2.circle(img, p_det, max(3, int(r_cyan*0.70)), (255,255,0), -1)
+                if draw_proj_corners:
+                    p_prj = tuple(np.int32(proj_corners[k]))
+                    # connector line from projected center to projected corner
+                    cv2.line(img, p_ctr, p_prj, (0,200,255), 2)
+                    # projected corner (magenta)
+                    cv2.circle(img, p_prj, max(4, int(r_mag+2)), (255,0,255), -1)
+        # Accumulate for RMS
+        obj_all.append(acc.id_to_obj[tid].reshape(-1,3))
+        img_all.append(det_corners.reshape(-1,2))
+    # Per-view RMS annotation (in pixels)
+    try:
+        if obj_all and img_all:
+            O = np.concatenate(obj_all, axis=0).astype(np.float32).reshape(-1,1,3)
+            I = np.concatenate(img_all, axis=0).astype(np.float32).reshape(-1,1,2)
+            proj,_ = cv2.projectPoints(O, rvec, tvec, K, D)
+            err = I.reshape(-1,2) - proj.reshape(-1,2)
+            rms_px = float(np.sqrt(np.mean(np.sum(err*err, axis=1))))
+            cv2.putText(img, f"Per-view RMS: {rms_px:.3f} px", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
+    except Exception:
+        pass
+    legend = "Cyan=detected corners/center, Black=projected center"
+    if draw_proj_corners:
+        legend += ", Magenta=projected corners"
+    cv2.putText(img, legend,
                 (16, img.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,255), 2)
     cv2.imwrite(path_png, img)
 
@@ -310,6 +409,10 @@ def main():
     parser.add_argument("--save-all-diag", action="store_true", help="Save diagnostic overlays for all kept frames")
     parser.add_argument("--board-source", type=str, choices=["harvard","grid8x5"], default="harvard",
                         help="Which board to use: Harvard pickle or original 8x5 grid")
+    parser.add_argument("--harvard-tag-size-m", type=float, default=None, help="Tag side length in meters for Harvard board (overrides pickle/env)")
+    parser.add_argument("--harvard-tag-spacing-m", type=float, default=None, help="Tag spacing (meters) for Harvard board (informational)")
+    parser.add_argument("--corner-order", type=str, default=None,
+                        help="Manual corner order override as four comma-separated indices, e.g. '0,1,2,3'. Applies to all detections. If provided, auto corner reordering is disabled.")
     args,_ = parser.parse_known_args()
 
     # camera selection helper
@@ -328,6 +431,14 @@ def main():
     global _APRIL_LOCAL_PICKLE
     if args.april_pickle:
         _APRIL_LOCAL_PICKLE = args.april_pickle
+    # Optional Harvard tag size override
+    global _HARVARD_TAG_SIZE_M
+    if args.harvard_tag_size_m is not None:
+        _HARVARD_TAG_SIZE_M = float(args.harvard_tag_size_m)
+    # Optional Harvard tag spacing (informational)
+    global _HARVARD_TAG_SPACING_M
+    if args.harvard_tag_spacing_m is not None:
+        _HARVARD_TAG_SPACING_M = float(args.harvard_tag_spacing_m)
     # Board source selection
     global _BOARD_SOURCE
     _BOARD_SOURCE = str(args.board_source or "harvard").lower().strip()
@@ -359,7 +470,23 @@ def main():
         except Exception as e:
             print(str(e))
             return
-        acc = CalibrationAccumulator(board, image_size)
+        # Parse optional corner order override
+        corner_order_override = None
+        disable_autoreorder = False
+        if args.corner_order:
+            try:
+                parts = [int(x.strip()) for x in args.corner_order.split(",")]
+                if len(parts) == 4 and sorted(parts) == [0,1,2,3]:
+                    corner_order = parts
+                    corner_order_override = corner_order
+                    disable_autoreorder = True
+                else:
+                    print(f"[WARN] Ignoring invalid --corner-order '{args.corner_order}'. Expected 4 comma-separated indices 0..3.")
+            except Exception as _e:
+                print(f"[WARN] Failed to parse --corner-order '{args.corner_order}': {_e}. Ignoring.")
+        acc = CalibrationAccumulator(board, image_size,
+                                     corner_order_override=corner_order_override,
+                                     disable_corner_autoreorder=disable_autoreorder)
         print("[APRIL] Backend:", acc.get_backend_name())
         print("[APRIL] Families:", acc._apriltag_family_string())
 
@@ -498,7 +625,23 @@ def main():
         cam.release()
         cv2.destroyAllWindows()
         return
-    acc = CalibrationAccumulator(board, image_size)
+    # Parse optional corner order override
+    corner_order_override = None
+    disable_autoreorder = False
+    if args.corner_order:
+        try:
+            parts = [int(x.strip()) for x in args.corner_order.split(",")]
+            if len(parts) == 4 and sorted(parts) == [0,1,2,3]:
+                corner_order = parts
+                corner_order_override = corner_order
+                disable_autoreorder = True
+            else:
+                print(f"[WARN] Ignoring invalid --corner-order '{args.corner_order}'. Expected 4 comma-separated indices 0..3.")
+        except Exception as _e:
+            print(f"[WARN] Failed to parse --corner-order '{args.corner_order}': {_e}. Ignoring.")
+    acc = CalibrationAccumulator(board, image_size,
+                                 corner_order_override=corner_order_override,
+                                 disable_corner_autoreorder=disable_autoreorder)
     print("[APRIL] Backend:", acc.get_backend_name())
     print("[APRIL] Families:", acc._apriltag_family_string())
 

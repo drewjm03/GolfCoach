@@ -44,12 +44,21 @@ def board_ids_safe(board):
     return np.asarray(ids, dtype=np.int32).reshape(-1, 1)
 
 class CalibrationAccumulator:
-    def __init__(self, board, image_size):
+    def __init__(self, board, image_size, corner_order_override=None, disable_corner_autoreorder=False):
         self.board = board
         self.image_size = image_size
         self.detector = self._make_detector()
         self._pupil = None
         self.backend_name = "OpenCV ArUco"
+        # Optional corner ordering controls
+        self.corner_order_override = None
+        if isinstance(corner_order_override, (list, tuple)) and len(corner_order_override) == 4:
+            try:
+                if sorted(list(corner_order_override)) == [0, 1, 2, 3]:
+                    self.corner_order_override = [int(x) for x in corner_order_override]
+            except Exception:
+                self.corner_order_override = None
+        self.disable_corner_autoreorder = bool(disable_corner_autoreorder)
         if HAVE_PUPIL:
             try:
                 self._pupil = PupilDetector(
@@ -168,8 +177,10 @@ class CalibrationAccumulator:
                     if getattr(d, "decision_margin", 0.0) < config.MIN_DECISION_MARGIN:
                         continue
                     c = np.array(d.corners, dtype=np.float32).reshape(1, 4, 2)
-                    # Normalize corner order to match board's corner convention
-                    if tid in self.id_to_obj:
+                    # Apply manual override or auto-reorder to match board convention
+                    if self.corner_order_override is not None:
+                        c = c[:, self.corner_order_override, :]
+                    elif not self.disable_corner_autoreorder and (tid in self.id_to_obj):
                         c = reorder_corners_to_board(c, self.id_to_obj[tid])
                     if self._avg_side_px(c) < config.MIN_SIDE_PX:
                         continue
@@ -198,6 +209,9 @@ class CalibrationAccumulator:
                 continue
             if allowed_ids is not None and tid not in allowed_ids:
                 continue
+            # Normalize corner order to match board's corner convention
+            if tid in self.id_to_obj:
+                c = reorder_corners_to_board(c, self.id_to_obj[tid])
             filt_c.append(c); filt_i.append([tid])
 
         if not filt_i:

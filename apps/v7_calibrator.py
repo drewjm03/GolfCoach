@@ -265,7 +265,7 @@ def try_load_harvard_coarse_board(dictionary):
             if hasattr(data, "getObjPoints") and (hasattr(data, "ids") or hasattr(data, "getIds")):
                 return data
             # Otherwise parse known structures
-            board = _parse_board_from_data(dictionary, bd if bd is not None else data)
+            board = _parse_board_from_data(dictionary, bd if bd is not None else data, data_root=data)
             if board is not None:
                 print(f"[BOARD] Loaded Harvard board from local file: {local_override}")
                 return board
@@ -291,7 +291,7 @@ def try_load_harvard_coarse_board(dictionary):
                     continue
                 data = pickle.loads(resp.content)
                 bd = data.get('at_coarseboard', None)
-                board = _parse_board_from_data(dictionary, bd)
+                board = _parse_board_from_data(dictionary, bd if bd is not None else data, data_root=data)
                 if board is not None:
                     print(f"[BOARD] Loaded Harvard board from: {url}")
                     return board
@@ -302,7 +302,7 @@ def try_load_harvard_coarse_board(dictionary):
                 time.sleep(0.5)
     return None
 
-def _parse_board_from_data(dictionary, bd):
+def _parse_board_from_data(dictionary, bd, data_root=None):
     try:
         if bd is None:
             return None
@@ -322,6 +322,35 @@ def _parse_board_from_data(dictionary, bd):
                     obj_points.append(P.reshape(4, 3))
                     ids_list.append(int(tid))
         elif isinstance(bd, (list, tuple)) and len(bd) > 0:
+            # Optional: infer center unit->meter scale from env-provided tag size and spacing
+            center_scale = None
+            try:
+                env_size = os.environ.get("HARVARD_TAG_SIZE_M", "").strip()
+                env_space = os.environ.get("HARVARD_TAG_SPACING_M", "").strip()
+                if env_size and env_space:
+                    size_val = float(env_size); space_val = float(env_space)
+                    desired_cc_m = size_val + space_val
+                    # collect centers in pickle units
+                    centers_units = []
+                    for _it in bd:
+                        if isinstance(_it, dict) and 'center' in _it:
+                            c = np.array(_it['center'], dtype=np.float32).reshape(-1)
+                            centers_units.append(c[:2].astype(np.float32))
+                    if centers_units and desired_cc_m > 0:
+                        C = np.vstack(centers_units)
+                        dists = []
+                        for i in range(C.shape[0]):
+                            di = np.hypot(C[i,0]-C[:,0], C[i,1]-C[:,1])
+                            di = di[di > 1e-6]
+                            if di.size > 0:
+                                dists.append(float(np.min(di)))
+                        if dists:
+                            nn_units = float(np.median(np.array(dists, dtype=np.float32)))
+                            if nn_units > 0:
+                                center_scale = desired_cc_m / nn_units
+                                print(f\"[BOARD] Harvard center scale inferred: {center_scale:.6f} m/unit (nn={nn_units:.6f} units, cc={desired_cc_m:.6f} m)\")
+            except Exception as _e:
+                pass
             for item in bd:
                 if isinstance(item, dict):
                     # Case A: dict with 'id' and 'corners'/'objPoints'
@@ -337,13 +366,39 @@ def _parse_board_from_data(dictionary, bd):
                         continue
                     # Case B: dict with 'tag_id' and 'center' (Harvard format)
                     if 'tag_id' in item and 'center' in item:
+                        # Determine tag size in meters: from env or data_root metadata
+                        size_m = None
+                        env = os.environ.get("HARVARD_TAG_SIZE_M", "").strip()
+                        if env:
+                            try:
+                                size_m = float(env)
+                            except Exception:
+                                size_m = None
+                        if size_m is None and isinstance(data_root, dict):
+                            for k in ("tag_size", "tag_side", "tag_width", "april_tag_side", "tag_length", "marker_length"):
+                                if k in data_root and isinstance(data_root[k], (int, float)):
+                                    size_m = float(data_root[k]); break
+                            if size_m is None:
+                                for pk in ("params", "metadata", "board_params"):
+                                    sub = data_root.get(pk)
+                                    if isinstance(sub, dict):
+                                        for k in ("tag_size", "tag_side", "tag_width", "april_tag_side", "tag_length", "marker_length"):
+                                            if k in sub and isinstance(sub[k], (int, float)):
+                                                size_m = float(sub[k]); break
+                                    if size_m is not None:
+                                        break
+                        if size_m is None:
+                            print("[BOARD] ERROR: Harvard centers found but tag size unknown. Set HARVARD_TAG_SIZE_M env.")
+                            return None
                         tid = int(item['tag_id'])
                         c = np.array(item['center'], dtype=np.float32).reshape(-1)
+                        if center_scale is not None:
+                            c = c * float(center_scale)
                         if c.size == 2:
                             cx, cy = float(c[0]), float(c[1]); cz = 0.0
                         else:
                             cx, cy, cz = float(c[0]), float(c[1]), float(c[2])
-                        half = float(TAG_SIZE_M) * 0.5
+                        half = float(size_m) * 0.5
                         pts3 = np.array([
                             [cx - half, cy - half, cz],
                             [cx + half, cy - half, cz],
@@ -442,6 +497,37 @@ def board_ids_safe(board):
         ids = np.arange(N, dtype=np.int32).reshape(-1, 1)
     return np.asarray(ids, dtype=np.int32).reshape(-1, 1)
 
+def reorder_corners_to_board(corners_1x4x2: np.ndarray, obj4x3: np.ndarray) -> np.ndarray:
+    """
+    Normalize detected image-space corners (1x4x2) to match the board's 3D corner
+    ordering by choosing the permutation whose projective mapping best aligns.
+    This compensates for differing corner order conventions (e.g., Apriltag CCW vs
+    OpenCV ArUco CW) and tag rotations.
+    """
+    img = corners_1x4x2.reshape(4, 2).astype(np.float32)
+    obj = np.asarray(obj4x3, dtype=np.float32)[:, :2]  # use (x,y) of object corners
+    perms = [
+        [0, 1, 2, 3],
+        [1, 2, 3, 0],
+        [2, 3, 0, 1],
+        [3, 0, 1, 2],
+        [0, 3, 2, 1],
+        [3, 2, 1, 0],
+        [2, 1, 0, 3],
+        [1, 0, 3, 2],
+    ]
+    best_p, best_err = None, 1e9
+    for p in perms:
+        imgp = img[p]
+        H, _ = cv2.findHomography(obj, imgp, 0)
+        if H is None:
+            continue
+        proj = cv2.perspectiveTransform(obj.reshape(-1, 1, 2), H).reshape(-1, 2)
+        err = float(np.mean(np.linalg.norm(proj - imgp, axis=1)))
+        if np.isfinite(err) and err < best_err:
+            best_err = err
+            best_p = p
+    return img[best_p].reshape(1, 4, 2) if best_p is not None else corners_1x4x2
 
 def set_white_balance_uvc(cap, kelvin=4500):
     cap.set(cv2.CAP_PROP_AUTO_WB, 0)
@@ -832,7 +918,10 @@ class CalibrationAccumulator:
                         continue
                     if getattr(d, "decision_margin", 0.0) < MIN_DECISION_MARGIN:
                         continue
-                    c = np.array(d.corners, dtype=np.float32).reshape(1, 4, 2)
+                c = np.array(d.corners, dtype=np.float32).reshape(1, 4, 2)
+                # Normalize corner order to match board's (Apriltag returns CCW; OpenCV ArUco uses CW)
+                if tid in self.id_to_obj:
+                    c = reorder_corners_to_board(c, self.id_to_obj[tid])
                     if self._avg_side_px(c) < MIN_SIDE_PX:
                         continue
                     if allowed_ids is not None and tid not in allowed_ids:
@@ -862,6 +951,9 @@ class CalibrationAccumulator:
                 continue
             if allowed_ids is not None and tid not in allowed_ids:
                 continue
+            # Normalize corner order to match board's convention
+            if tid in self.id_to_obj:
+                c = reorder_corners_to_board(c, self.id_to_obj[tid])
             filt_c.append(c); filt_i.append([tid])
 
         if not filt_i:
