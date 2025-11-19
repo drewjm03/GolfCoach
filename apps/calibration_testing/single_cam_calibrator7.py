@@ -489,6 +489,9 @@ def main():
                                      disable_corner_autoreorder=disable_autoreorder)
         print("[APRIL] Backend:", acc.get_backend_name())
         print("[APRIL] Families:", acc._apriltag_family_string())
+        print("[DBG] backend=", acc.get_backend_name(),
+              "corner_order_override=", getattr(acc, "corner_order_override", None),
+              "disable_corner_autoreorder=", getattr(acc, "disable_corner_autoreorder", None))
 
         kept_frames = []
         for p in paths:
@@ -644,6 +647,9 @@ def main():
                                  disable_corner_autoreorder=disable_autoreorder)
     print("[APRIL] Backend:", acc.get_backend_name())
     print("[APRIL] Families:", acc._apriltag_family_string())
+    print("[DBG] backend=", acc.get_backend_name(),
+          "corner_order_override=", getattr(acc, "corner_order_override", None),
+          "disable_corner_autoreorder=", getattr(acc, "disable_corner_autoreorder", None))
 
     # UI/state
     calibrating=False; deadline=0.0; last_sample=0.0; last_accept=0.0; keyframes=[]

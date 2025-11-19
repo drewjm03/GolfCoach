@@ -1,0 +1,14 @@
+{
+  "image_size": [
+    1280,
+    720
+  ],
+  "APRIL_DICT": 20,
+  "board_source": "harvard",
+  "april_pickle": "data/AprilBoards2.pickle",
+  "harvard_tag_size_m": 0.03,
+  "harvard_tag_spacing_m": 0.008,
+  "corner_order": "3,0,1,2",
+  "target_keyframes": 30,
+  "accept_period": 1.0
+}

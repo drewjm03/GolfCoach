@@ -19,6 +19,8 @@ try:
 except Exception:
     HAVE_REQUESTS = False
 
+from .boards import harvard_tag_size_from_data_or_env, parse_board_pickle
+
 
 def load_board(board_source="harvard", april_pickle=None, harvard_tag_size_m=None, harvard_tag_spacing_m=None):
     """Return an OpenCV aruco Board based on selection: 'harvard' or 'grid8x5'."""
@@ -33,8 +35,7 @@ def load_board(board_source="harvard", april_pickle=None, harvard_tag_size_m=Non
         print(f"[BOARD] GridBoard 8x5, tag={tag_size_m}m sep={tag_sep_m}m")
         return cv2.aruco.GridBoard((tags_x, tags_y), tag_size_m, tag_sep_m, dictionary, ids)
 
-    # Harvard board: prefer local pickle, else env override, else attempt URL
-    # Accepts structures: dict with 'ids' and 'objPoints'/'corners', list of dict objects with 'tag_id' and 'center'
+    # Harvard board: prefer local pickle, else env override, else attempt URL (use shared parser)
     data = None
     if april_pickle:
         path = os.path.abspath(april_pickle)
@@ -65,118 +66,9 @@ def load_board(board_source="harvard", april_pickle=None, harvard_tag_size_m=Non
         if data is None:
             raise RuntimeError(f"[BOARD] Failed to fetch Harvard board: {last_err}")
 
-    # Parse data
-    def parse_from(data_obj):
-        # If it's already a Board
-        if hasattr(data_obj, "getObjPoints") and (hasattr(data_obj, "ids") or hasattr(data_obj, "getIds")):
-            return data_obj
-        # Try common keys
-        for k in ("at_board_d", "at_coarseboard", "board", "at_board"):
-            if isinstance(data_obj, dict) and k in data_obj:
-                bd = data_obj[k]
-                br = parse_from(bd)
-                if br is not None:
-                    return br
-        # Try to build from dict/list formats
-        obj_points = []
-        ids_list = []
-        if isinstance(data_obj, dict) and "ids" in data_obj:
-            ids_raw = list(data_obj.get("ids", []))
-            corners_raw = data_obj.get("objPoints", data_obj.get("corners", []))
-            for tid, pts in zip(ids_raw, corners_raw):
-                P = np.array(pts, dtype=np.float32).reshape(-1, 3 if np.array(pts).shape[-1] == 3 else 2)
-                if P.shape[1] == 2:
-                    P = np.hstack([P, np.zeros((P.shape[0], 1), dtype=np.float32)])
-                if P.shape[0] == 4:
-                    obj_points.append(P.reshape(4, 3))
-                    ids_list.append(int(tid))
-        elif isinstance(data_obj, (list, tuple)) and len(data_obj) > 0:
-            # Pre-collect centers to infer unit->meter scale from tag_size + spacing if provided
-            centers_units = []
-            if harvard_tag_size_m is not None and harvard_tag_spacing_m is not None:
-                for item in data_obj:
-                    if isinstance(item, dict) and "tag_id" in item and "center" in item:
-                        c = np.array(item["center"], dtype=np.float32).reshape(-1)
-                        centers_units.append(c[:2].astype(np.float32))
-            center_scale = None
-            if centers_units:
-                C = np.vstack(centers_units)
-                dists = []
-                for i in range(C.shape[0]):
-                    di = np.hypot(C[i,0]-C[:,0], C[i,1]-C[:,1])
-                    di = di[di > 1e-6]
-                    if di.size > 0:
-                        dists.append(np.min(di))
-                if dists:
-                    nn_units = float(np.median(np.array(dists, dtype=np.float32)))
-                    desired_cc_m = float(harvard_tag_size_m) + float(harvard_tag_spacing_m)
-                    if nn_units > 0:
-                        center_scale = desired_cc_m / nn_units
-                        print(f"[BOARD] Harvard center scale inferred: {center_scale:.6f} m/unit (nn={nn_units:.6f} units, cc={desired_cc_m:.6f} m)")
-            for item in data_obj:
-                if isinstance(item, dict):
-                    # dict with id/corners
-                    if "id" in item and ("corners" in item or "objPoints" in item):
-                        tid = int(item["id"])
-                        pts = item.get("objPoints", item.get("corners"))
-                        P = np.array(pts, dtype=np.float32).reshape(-1, 3 if np.array(pts).shape[-1] == 3 else 2)
-                        if P.shape[1] == 2:
-                            P = np.hstack([P, np.zeros((P.shape[0], 1), dtype=np.float32)])
-                        if P.shape[0] == 4:
-                            obj_points.append(P.reshape(4, 3))
-                            ids_list.append(tid)
-                        continue
-                    # Harvard dict with tag_id + center
-                    if "tag_id" in item and "center" in item:
-                        # Prefer explicit CLI/env size; else try from pickle metadata
-                        size_m = None
-                        if harvard_tag_size_m is not None:
-                            size_m = float(harvard_tag_size_m)
-                        else:
-                            # Look for metadata in the outer scope (data) for a size
-                            if isinstance(data, dict):
-                                for k in ("tag_size", "tag_side", "tag_width", "april_tag_side", "tag_length", "marker_length"):
-                                    if k in data and isinstance(data[k], (int, float)):
-                                        size_m = float(data[k]); break
-                                if size_m is None:
-                                    for pk in ("params", "metadata", "board_params"):
-                                        sub = data.get(pk)
-                                        if isinstance(sub, dict):
-                                            for k in ("tag_size", "tag_side", "tag_width", "april_tag_side", "tag_length", "marker_length"):
-                                                if k in sub and isinstance(sub[k], (int, float)):
-                                                    size_m = float(sub[k]); break
-                                        if size_m is not None:
-                                            break
-                        if size_m is None:
-                            raise RuntimeError("[BOARD] Harvard centers found but tag size unknown. Provide --harvard-tag-size-m or HARVARD_TAG_SIZE_M.")
-                        tid = int(item["tag_id"])
-                        c = np.array(item["center"], dtype=np.float32).reshape(-1)
-                        if center_scale is not None:
-                            c = c * float(center_scale)
-                        if c.size == 2:
-                            cx, cy, cz = float(c[0]), float(c[1]), 0.0
-                        else:
-                            cx, cy, cz = float(c[0]), float(c[1]), float(c[2])
-                        half = float(size_m) * 0.5
-                        pts3 = np.array([
-                            [cx - half, cy - half, cz],
-                            [cx + half, cy - half, cz],
-                            [cx + half, cy + half, cz],
-                            [cx - half, cy + half, cz],
-                        ], dtype=np.float32)
-                        obj_points.append(pts3.reshape(4, 3)); ids_list.append(tid)
-        if not obj_points or not ids_list:
-            return None
-        ids_arr = np.array(ids_list, dtype=np.int32).reshape(-1, 1)
-        try:
-            return cv2.aruco.Board(obj_points, dictionary, ids_arr)
-        except Exception:
-            try:
-                return cv2.aruco.Board_create(obj_points, dictionary, ids_arr)
-            except Exception:
-                return None
-
-    board = parse_from(data)
+    # Use shared parser for identical behavior with mono script
+    size_m = harvard_tag_size_from_data_or_env(data, cli_size=harvard_tag_size_m)
+    board = parse_board_pickle(dictionary, data, tag_size_m=size_m, harvard_tag_spacing_m=harvard_tag_spacing_m)
     if board is None:
         raise RuntimeError("[BOARD] Harvard board found but format was not recognized.")
     print("[BOARD] Harvard board loaded")
@@ -217,6 +109,105 @@ def camera_pose_in_board(rvec, tvec, axis_len=0.2):
     y_axis = (R.T @ np.array([[0, axis_len, 0]]).T).reshape(3) + origin
     z_axis = (R.T @ np.array([[0, 0, axis_len]]).T).reshape(3) + origin
     return origin, x_axis, y_axis, z_axis
+
+
+# ---------- debug helpers (copied from mono script) ----------
+def _print_intrinsics(K, D):
+    try:
+        fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+    except Exception:
+        fx = fy = cx = cy = float("nan")
+    dlen = (int(D.size) if D is not None else 0)
+    print(f"[INTR] fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}  D_len={dlen}")
+
+def calibrate_pinhole_full(obj_list, img_list, image_size, K_seed=None):
+    # obj_list: list of (N,3), img_list: list of (N,2)
+    obj_std = [o.reshape(-1,3).astype(np.float32, copy=False) for o in obj_list]
+    img_std = [i.reshape(-1,2).astype(np.float32, copy=False) for i in img_list]
+    if K_seed is not None:
+        K = K_seed.copy().astype(np.float64)
+        D = np.zeros((8,1), dtype=np.float64)
+        flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_RATIONAL_MODEL)
+    else:
+        K = None
+        D = None
+        flags = cv2.CALIB_RATIONAL_MODEL
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-7)
+    rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+        obj_std, img_std, image_size, K, D, flags=flags, criteria=crit
+    )
+    return float(rms), K, D, rvecs, tvecs
+
+def _save_diag_pinhole(path_png, frame_bgr, corners, ids, acc, K, D, rvec, tvec,
+                       r_cyan=8, r_mag=3, draw_corners=True, draw_proj_corners=True):
+    img = frame_bgr.copy()
+    # Accumulate for per-view RMS
+    obj_all = []
+    img_all = []
+    for c, iv in zip(corners, ids):
+        tid = int(iv[0])
+        if tid not in acc.id_to_obj: 
+            continue
+        obj4 = acc.id_to_obj[tid].astype(np.float64).reshape(-1,1,3)  # 4x1x3
+        proj,_ = cv2.projectPoints(obj4, rvec, tvec, K, D)            # 4x1x2
+        det_corners = c.reshape(4,2).astype(np.float32)               # 4x2
+        proj_corners = proj.reshape(-1,2)                             # 4x2
+        det_center = det_corners.mean(axis=0)
+        proj_center = proj_corners.mean(axis=0)
+        cv2.circle(img, tuple(np.int32(det_center)), int(r_cyan), (255,255,0), -1)  # cyan (detected center)
+        # projected center in black for contrast
+        cv2.circle(img, tuple(np.int32(proj_center)), max(3, int(r_mag+1)), (0,0,0), -1)  # black (projected center)
+        if draw_corners:
+            p_ctr = tuple(np.int32(proj_center))
+            for k in range(4):
+                p_det = tuple(np.int32(det_corners[k]))
+                # detected corner (cyan)
+                cv2.circle(img, p_det, max(3, int(r_cyan*0.70)), (255,255,0), -1)
+                if draw_proj_corners:
+                    p_prj = tuple(np.int32(proj_corners[k]))
+                    # connector line from projected center to projected corner
+                    cv2.line(img, p_ctr, p_prj, (0,200,255), 2)
+                    # projected corner (magenta)
+                    cv2.circle(img, p_prj, max(4, int(r_mag+2)), (255,0,255), -1)
+        # Accumulate for RMS
+        obj_all.append(acc.id_to_obj[tid].reshape(-1,3))
+        img_all.append(det_corners.reshape(-1,2))
+    # Per-view RMS annotation (in pixels)
+    try:
+        if obj_all and img_all:
+            O = np.concatenate(obj_all, axis=0).astype(np.float32).reshape(-1,1,3)
+            I = np.concatenate(img_all, axis=0).astype(np.float32).reshape(-1,1,2)
+            proj,_ = cv2.projectPoints(O, rvec, tvec, K, D)
+            err = I.reshape(-1,2) - proj.reshape(-1,2)
+            rms_px = float(np.sqrt(np.mean(np.sum(err*err, axis=1))))
+            cv2.putText(img, f"Per-view RMS: {rms_px:.3f} px", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
+    except Exception:
+        pass
+    legend = "Cyan=detected corners/center, Black=projected center"
+    if draw_proj_corners:
+        legend += ", Magenta=projected corners"
+    cv2.putText(img, legend, (16, img.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,255), 2)
+    cv2.imwrite(path_png, img)
+
+def _view_rms_pinhole(obj_pts, img_pts, K, D, rvec, tvec):
+    proj,_ = cv2.projectPoints(obj_pts.reshape(-1,1,3).astype(np.float32), rvec, tvec, K, D)
+    proj = proj.reshape(-1,2)
+    err = img_pts.reshape(-1,2).astype(np.float32) - proj
+    return float(np.sqrt(np.mean(np.sum(err*err, axis=1))))
+
+# ---- selection criteria to match mono script ----
+MIN_TAGS_PER_VIEW = 6
+MIN_SPAN = 0.35
+MAX_VIEW_RMS_PX = 5.0
+
+def _has_coverage(corners, W, H, min_span=MIN_SPAN):
+    xs = [p[0] for ci in corners for p in ci.reshape(4,2)]
+    ys = [p[1] for ci in corners for p in ci.reshape(4,2)]
+    if not xs:
+        return False
+    span_x = (max(xs)-min(xs))/float(max(1.0,W))
+    span_y = (max(ys)-min(ys))/float(max(1.0,H))
+    return min(span_x, span_y) >= min_span
 
 
 def plot_3d(board, K0, D0, K1, D1, corners0, ids0, corners1, ids1, acc, frame0_bgr, frame1_bgr, out_html, R_01=None, T_01=None):
@@ -347,6 +338,11 @@ def main():
     parser.add_argument("--cam1", type=int, default=1, help="Camera index for right/second camera")
     parser.add_argument("--mono-max-views", type=int, default=30, help="Max views used for each mono calibration")
     parser.add_argument("--mono-max-iters", type=int, default=60, help="Max iterations for mono calibration solver")
+    parser.add_argument("--corner-order", type=str, default=None,
+                        help="Manual corner order override as four comma-separated indices, e.g. '0,1,2,3'. "
+                             "If provided, auto corner reordering is disabled.")
+    parser.add_argument("--save-keyframes", action="store_true",
+                        help="If set, save accepted keyframes from both cameras and detections to data/ for later calibration.")
     args, _ = parser.parse_known_args()
 
     # Open two cameras
@@ -360,12 +356,70 @@ def main():
     # Build board and accumulator
     board = load_board(board_source=args.board_source, april_pickle=args.april_pickle,
                        harvard_tag_size_m=args.harvard_tag_size_m, harvard_tag_spacing_m=args.harvard_tag_spacing_m)
-    acc = CalibrationAccumulator(board, image_size)
+
+    # Parse optional corner order override (same behavior as mono script)
+    corner_order_override = None
+    disable_autoreorder = False
+    if args.corner_order:
+        try:
+            parts = [int(x.strip()) for x in args.corner_order.split(",")]
+            if len(parts) == 4 and sorted(parts) == [0, 1, 2, 3]:
+                corner_order_override = parts
+                disable_autoreorder = True
+                print(f"[APRIL] Using manual corner order: {corner_order_override}")
+            else:
+                print(f"[WARN] Ignoring invalid --corner-order '{args.corner_order}'. Expected 4 comma-separated indices 0..3.")
+        except Exception as e:
+            print(f"[WARN] Failed to parse --corner-order '{args.corner_order}': {e}. Ignoring.")
+    else:
+        # Match mono calibrator default: for Harvard board, prefer 3,0,1,2 if not specified
+        if str(args.board_source).lower().strip() == "harvard":
+            corner_order_override = [3,0,1,2]
+            disable_autoreorder = True
+            print("[APRIL] Using default per-tag corner order 3,0,1,2 for Harvard board")
+
+    acc = CalibrationAccumulator(board, image_size,
+                                 corner_order_override=corner_order_override,
+                                 disable_corner_autoreorder=disable_autoreorder)
+    print("[APRIL] Backend:", acc.get_backend_name())
+    print("[APRIL] Families:", acc._apriltag_family_string())
+    print("[DBG] backend=", acc.get_backend_name(),
+          "corner_order_override=", getattr(acc, "corner_order_override", None),
+          "disable_corner_autoreorder=", getattr(acc, "disable_corner_autoreorder", None))
 
     # Collect keyframes
     keyframes = []
     last_accept = 0.0
     print(f"[MAIN] Target keyframes: {args.target_keyframes}")
+
+    # Optional keyframe recorder
+    record_dir = None
+    if args.save_keyframes:
+        try:
+            repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+            base_out = os.path.join(repo_root, "data") if not args.out_dir else os.path.abspath(args.out_dir)
+            os.makedirs(base_out, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            record_dir = os.path.join(base_out, f"stereo_keyframes_{stamp}")
+            os.makedirs(record_dir, exist_ok=True)
+            # Write session meta
+            meta = {
+                "image_size": [int(W), int(H)],
+                "APRIL_DICT": int(getattr(config, "APRIL_DICT", 0)),
+                "board_source": str(args.board_source),
+                "april_pickle": args.april_pickle or "",
+                "harvard_tag_size_m": float(args.harvard_tag_size_m) if args.harvard_tag_size_m is not None else None,
+                "harvard_tag_spacing_m": float(args.harvard_tag_spacing_m) if args.harvard_tag_spacing_m is not None else None,
+                "corner_order": args.corner_order or "",
+                "target_keyframes": int(args.target_keyframes),
+                "accept_period": float(args.accept_period),
+            }
+            with open(os.path.join(record_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+            print(f"[REC] Saving stereo keyframes to {record_dir}")
+        except Exception as e:
+            print("[REC] Failed to initialize keyframe recorder:", e)
+            record_dir = None
     try:
         while len(keyframes) < args.target_keyframes:
             try:
@@ -386,6 +440,30 @@ def main():
                 keyframes.append((f0.copy(), f1.copy()))
                 last_accept = now
                 print(f"[CAL] Keyframes: {len(keyframes)}  stereo_samples: {len(acc.stereo_samples)}")
+                # Save images and detections if recording
+                if record_dir:
+                    try:
+                        idx = len(keyframes) - 1
+                        out_img0 = os.path.join(record_dir, f"frame_{idx:03d}_cam0.png")
+                        out_img1 = os.path.join(record_dir, f"frame_{idx:03d}_cam1.png")
+                        cv2.imwrite(out_img0, f0)
+                        cv2.imwrite(out_img1, f1)
+                        # Use last appended detections
+                        ids0 = acc.ids0[-1] if len(acc.ids0) > 0 else None
+                        ids1 = acc.ids1[-1] if len(acc.ids1) > 0 else None
+                        corners0 = acc.corners0[-1] if len(acc.corners0) > 0 else None
+                        corners1 = acc.corners1[-1] if len(acc.corners1) > 0 else None
+                        out_js = os.path.join(record_dir, f"frame_{idx:03d}.json")
+                        with open(out_js, "w", encoding="utf-8") as f:
+                            json.dump({
+                                "size": [int(W), int(H)],
+                                "ids0": ([] if ids0 is None else [int(iv[0]) for iv in ids0]),
+                                "ids1": ([] if ids1 is None else [int(iv[0]) for iv in ids1]),
+                                "corners0": ([] if corners0 is None else [c.reshape(4,2).tolist() for c in corners0]),
+                                "corners1": ([] if corners1 is None else [c.reshape(4,2).tolist() for c in corners1]),
+                            }, f, indent=2)
+                    except Exception as e:
+                        print("[REC] Failed to write keyframe artifacts:", e)
     finally:
         for c in cams:
             c.release()
@@ -406,52 +484,103 @@ def main():
     def mono_calibrate(which):
         corners = acc.corners0 if which == 0 else acc.corners1
         ids = acc.ids0 if which == 0 else acc.ids1
-        obj_pts_list, img_pts_list = [], []
-        view_sizes = []
-        for corners_img, ids_img in zip(corners, ids):
+        # Debug at start
+        try:
+            print(f"[DBG] Mono{which}: raw views = {len(corners)}")
+            for vi, (corners_img, ids_img) in enumerate(zip(corners, ids)):
+                n_ids = 0 if ids_img is None else len(ids_img)
+                print(f"[DBG] Mono{which}: view {vi}: ids={n_ids}")
+                if ids_img is not None and len(ids_img) > 0:
+                    sample = [int(iv[0]) for iv in ids_img[:8]]
+                    print(f"[DBG] Mono{which}: view {vi} sample ids: {sample}")
+                    try:
+                        missing = [tid for tid in sample if tid not in acc.id_to_obj]
+                    except Exception:
+                        missing = []
+                    print(f"[DBG] Mono{which}: sample missing in id_to_obj: {missing}")
+                    if which == 0 and vi == 0:
+                        try:
+                            print("[DBG] id_to_obj keys sample:", list(acc.id_to_obj.keys())[:20])
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        obj_list = []
+        img_list = []
+        for vi, (corners_img, ids_img) in enumerate(zip(corners, ids)):
+            if ids_img is None or len(ids_img) == 0:
+                continue
             O, I = [], []
             for c, iv in zip(corners_img, ids_img):
                 tid = int(iv[0])
-                if tid not in acc.id_to_obj: continue
-                O.append(acc.id_to_obj[tid]); I.append(c.reshape(-1, 2))
-            if O:
-                obj_cat = np.concatenate(O, axis=0).astype(np.float32)
-                img_cat = np.concatenate(I, axis=0).astype(np.float32)
-                obj_pts_list.append(obj_cat); img_pts_list.append(img_cat)
-                view_sizes.append(int(len(obj_cat)))
-        # Downselect to speed up if too many views
-        if len(obj_pts_list) > int(args.mono_max_views):
-            idxs = np.argsort(view_sizes)[::-1][:int(args.mono_max_views)]
-            obj_pts_list = [obj_pts_list[i] for i in idxs]
-            img_pts_list = [img_pts_list[i] for i in idxs]
-            print(f"[CAL] Mono{which}: using top {len(obj_pts_list)} views by tag coverage")
-        total_pts = sum(len(o) for o in obj_pts_list)
-        print(f"[CAL] Mono{which}: views={len(obj_pts_list)} points={total_pts}")
-        K = seed_K_pinhole(W, H, f_scale=1.0)
-        D = np.zeros((8,1), dtype=np.float64)
-        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, int(args.mono_max_iters), 1e-7)
+                if tid not in acc.id_to_obj:
+                    continue
+                O.append(acc.id_to_obj[tid])
+                I.append(c.reshape(-1, 2))
+            if not O:
+                continue
+            obj_cat = np.concatenate(O, axis=0).astype(np.float32)
+            img_cat = np.concatenate(I, axis=0).astype(np.float32)
+            obj_list.append(obj_cat)
+            img_list.append(img_cat)
+
+        total_pts = sum(len(o) for o in obj_list)
+        print(f"[CAL] Mono{which}: views={len(obj_list)} points={total_pts}")
+        if not obj_list:
+            raise RuntimeError(f"[CAL] Mono{which}: no valid views after ID mapping!")
+
+        K_seed = seed_K_pinhole(W, H, f_scale=1.0)
         t0 = time.perf_counter()
-        try:
-            rms, K, D, _, _ = cv2.calibrateCamera(
-                obj_pts_list, img_pts_list, image_size, K, D,
-                flags=(cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_RATIONAL_MODEL),
-                criteria=crit
-            )
-        except Exception as e:
-            print(f"[CAL] Mono{which} with guess failed ({e}); retrying without guess")
-            rms, K, D, _, _ = cv2.calibrateCamera(
-                obj_pts_list, img_pts_list, image_size, None, None,
-                flags=cv2.CALIB_RATIONAL_MODEL,
-                criteria=crit
-            )
+        rms, K, D, rvecs, tvecs = calibrate_pinhole_full(obj_list, img_list, image_size, K_seed)
         dt = time.perf_counter() - t0
         print(f"[CAL] Mono{which} done: RMS={rms:.3f} in {dt:.2f}s")
-        return rms, K, D
+        _print_intrinsics(K, D)
+
+        # Save one diagnostic view (best coverage by number of points)
+        try:
+            best_vi = max(range(len(obj_list)), key=lambda idx: len(obj_list[idx]))
+            diag_index = best_vi
+            best_corners = corners[diag_index]
+            best_ids     = ids[diag_index]
+            frame_bgr    = keyframes[diag_index][which]  # 0 or 1
+            repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+            out_dir = os.path.join(repo_root, "data"); os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            out_png = os.path.join(out_dir, f"stereo_mono{which}_diag_{stamp}.png")
+            _save_diag_pinhole(out_png, frame_bgr, best_corners, best_ids, acc, K, D, rvecs[best_vi], tvecs[best_vi], r_cyan=8, r_mag=3)
+            print(f"[SAVE] Mono{which} diag -> {out_png}")
+        except Exception as e:
+            print(f"[WARN] Failed to save Mono{which} diag: {e}")
+
+        return rms, K, D, obj_list, img_list, rvecs, tvecs
 
     print("[CAL] Calibrating mono intrinsics…")
-    rms0, K0, D0 = mono_calibrate(0)
-    rms1, K1, D1 = mono_calibrate(1)
+    rms0, K0, D0, obj0_list, img0_list, rvecs0, tvecs0 = mono_calibrate(0)
+    rms1, K1, D1, obj1_list, img1_list, rvecs1, tvecs1 = mono_calibrate(1)
     print(f"[CAL] RMS0={rms0:.3f}  RMS1={rms1:.3f}")
+
+    # Save per-camera diagnostic overlays for best-coverage views
+    try:
+        best0 = int(np.argmax([len(o) for o in obj0_list])) if obj0_list else -1
+        best1 = int(np.argmax([len(o) for o in obj1_list])) if obj1_list else -1
+        if best0 >= 0 or best1 >= 0:
+            repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+            out_dir = os.path.join(repo_root, "data") if not args.out_dir else os.path.abspath(args.out_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            if best0 >= 0:
+                frame0_bgr = keyframes[min(best0, len(keyframes)-1)][0]
+                diag0_png = os.path.join(out_dir, f"stereo_mono0_diag_{stamp}.png")
+                _save_diag_pinhole(diag0_png, frame0_bgr, acc.corners0[best0], acc.ids0[best0], acc, K0, D0, rvecs0[best0], tvecs0[best0])
+                print(f"[SAVE] Mono0 diag -> {diag0_png}")
+            if best1 >= 0:
+                frame1_bgr = keyframes[min(best1, len(keyframes)-1)][1]
+                diag1_png = os.path.join(out_dir, f"stereo_mono1_diag_{stamp}.png")
+                _save_diag_pinhole(diag1_png, frame1_bgr, acc.corners1[best1], acc.ids1[best1], acc, K1, D1, rvecs1[best1], tvecs1[best1])
+                print(f"[SAVE] Mono1 diag -> {diag1_png}")
+    except Exception as e:
+        print("[SAVE] Failed to write mono diagnostics:", e)
 
     # Stereo extrinsics
     obj_list = [s.obj_pts for s in acc.stereo_samples]
