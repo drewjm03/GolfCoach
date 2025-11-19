@@ -164,3 +164,4 @@ def parse_board_pickle(dictionary, data, tag_size_m=None, harvard_tag_spacing_m=
         return None
 
 
+
