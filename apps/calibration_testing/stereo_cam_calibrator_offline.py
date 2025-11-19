@@ -516,19 +516,21 @@ def main():
         n0 = 0 if ids0 is None else len(ids0)
         n1 = 0 if ids1 is None else len(ids1)
         
-        if n0 >= MIN_TAGS_PER_VIEW and corners0 and _has_coverage(corners0, W, H, MIN_SPAN):
+        ok0 = (n0 >= MIN_TAGS_PER_VIEW and corners0 and _has_coverage(corners0, W, H, MIN_SPAN))
+        ok1 = (n1 >= MIN_TAGS_PER_VIEW and corners1 and _has_coverage(corners1, W, H, MIN_SPAN))
+
+        if ok0:
             if acc._accumulate_single(0, corners0, ids0):
                 # Keep frame aligned with this mono view index
                 frames0_by_view.append(frame0_bgr.copy())
         
-        if n1 >= MIN_TAGS_PER_VIEW and corners1 and _has_coverage(corners1, W, H, MIN_SPAN):
+        if ok1:
             if acc._accumulate_single(1, corners1, ids1):
                 # Keep frame aligned with this mono view index
                 frames1_by_view.append(frame1_bgr.copy())
         
-        # Create stereo sample if both cameras have valid detections
-        if (n0 >= MIN_TAGS_PER_VIEW and n1 >= MIN_TAGS_PER_VIEW and
-            corners0 and corners1 and ids0 is not None and ids1 is not None):
+        # Create stereo sample if both cameras have valid, well-distributed detections
+        if ok0 and ok1 and ids0 is not None and ids1 is not None:
             stereo_sample = acc._match_stereo(corners0, ids0, corners1, ids1)
             if stereo_sample is not None and stereo_sample.obj_pts.shape[0] >= MIN_TAGS_PER_VIEW * 4:
                 acc.stereo_samples.append(stereo_sample)
@@ -676,22 +678,108 @@ def main():
     if len(acc.stereo_samples) < 5:
         print("[CAL] Not enough stereo samples; aborting stereo calibration.")
         return
-    
-    print("[CAL] Calibrating stereo extrinsics...")
-    obj_list_stereo = [s.obj_pts.reshape(-1, 1, 3).astype(np.float32) for s in acc.stereo_samples]
-    img0_list_stereo = [s.img_pts0.reshape(-1, 1, 2).astype(np.float32) for s in acc.stereo_samples]
-    img1_list_stereo = [s.img_pts1.reshape(-1, 1, 2).astype(np.float32) for s in acc.stereo_samples]
-    
-    flags = cv2.CALIB_FIX_INTRINSIC
+
+    # Helper: per-sample PnP RMS to prune bad stereo samples
+    def _pnp_rms_for_sample(sample, K, D, which_cam=0):
+        obj = sample.obj_pts.reshape(-1, 1, 3).astype(np.float32)
+        img = (sample.img_pts0 if which_cam == 0 else sample.img_pts1).reshape(-1, 1, 2).astype(np.float32)
+        try:
+            # Prefer IPPE_SQUARE when we have exactly one square (4 points)
+            if obj.shape[0] == 4:
+                ok, rvec, tvec = cv2.solvePnP(obj.reshape(-1, 3), img.reshape(-1, 2), K, D,
+                                              flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            else:
+                ok, rvec, tvec = cv2.solvePnP(obj.reshape(-1, 3), img.reshape(-1, 2), K, D,
+                                              flags=cv2.SOLVEPNP_ITERATIVE)
+        except cv2.error:
+            return float("inf")
+        if not ok:
+            return float("inf")
+        return _view_rms_pinhole(obj, img, K, D, rvec, tvec)
+
+    print("[CAL] Evaluating stereo samples per camera (PnP RMS) and baseline consistency...")
+    obj_list_stereo_all = [s.obj_pts.reshape(-1, 1, 3).astype(np.float32) for s in acc.stereo_samples]
+    img0_list_stereo_all = [s.img_pts0.reshape(-1, 1, 2).astype(np.float32) for s in acc.stereo_samples]
+    img1_list_stereo_all = [s.img_pts1.reshape(-1, 1, 2).astype(np.float32) for s in acc.stereo_samples]
+
+    good_idxs = []
+    R10_list = []
+    t10_list = []
+    stereo_rms_thresh = MAX_VIEW_RMS_PX if MAX_VIEW_RMS_PX > 0 else 5.0
+    for i, s in enumerate(acc.stereo_samples):
+        rms0 = _pnp_rms_for_sample(s, K0, D0, which_cam=0)
+        rms1 = _pnp_rms_for_sample(s, K1, D1, which_cam=1)
+        print(f"[CAL] Stereo sample {i:03d}: cam0={rms0:.2f}px  cam1={rms1:.2f}px")
+
+        # Baseline-consistency diagnostic from per-sample PnP
+        obj = obj_list_stereo_all[i]        # (N,1,3)
+        img0 = img0_list_stereo_all[i]      # (N,1,2)
+        img1 = img1_list_stereo_all[i]      # (N,1,2)
+        try:
+            ok0, rvec0, tvec0 = cv2.solvePnP(obj.reshape(-1, 3), img0.reshape(-1, 2), K0, D0,
+                                            flags=cv2.SOLVEPNP_ITERATIVE)
+            ok1, rvec1, tvec1 = cv2.solvePnP(obj.reshape(-1, 3), img1.reshape(-1, 2), K1, D1,
+                                            flags=cv2.SOLVEPNP_ITERATIVE)
+        except cv2.error:
+            ok0 = ok1 = False
+        if ok0 and ok1:
+            R0, _ = cv2.Rodrigues(rvec0)
+            R1, _ = cv2.Rodrigues(rvec1)
+            R10 = R1 @ R0.T
+            t10 = tvec1 - R10 @ tvec0
+            R10_list.append(R10)
+            t10_list.append(t10)
+            tnorm = float(np.linalg.norm(t10.reshape(-1)))
+            print(f"[BASE] sample {i:03d}: |t10|={tnorm:.4f}, t10={t10.ravel()}")
+
+        if rms0 <= stereo_rms_thresh and rms1 <= stereo_rms_thresh:
+            good_idxs.append(i)
+
+    print(f"[CAL] Stereo filter: kept={len(good_idxs)} of {len(acc.stereo_samples)} (threshold={stereo_rms_thresh:.1f}px)")
+
+    # Aggregate baseline statistics over all PnP-successful samples
+    if t10_list:
+        t_stack = np.hstack([t.reshape(3, 1) for t in t10_list])  # 3xM
+        norms = np.linalg.norm(t_stack, axis=0)
+        mean_norm = float(np.mean(norms))
+        std_norm = float(np.std(norms))
+        print(f"[BASE] baseline |t10| mean={mean_norm:.4f} std={std_norm:.4f} over {len(norms)} samples")
+    if len(good_idxs) < 5:
+        print("[CAL] Not enough good stereo samples after filtering; aborting stereo calibration.")
+        return
+
+    # Build stereo lists strictly from the kept indices
+    obj_list_stereo  = [acc.stereo_samples[i].obj_pts.reshape(-1, 1, 3).astype(np.float32) for i in good_idxs]
+    img0_list_stereo = [acc.stereo_samples[i].img_pts0.reshape(-1, 1, 2).astype(np.float32) for i in good_idxs]
+    img1_list_stereo = [acc.stereo_samples[i].img_pts1.reshape(-1, 1, 2).astype(np.float32) for i in good_idxs]
+    print(f"[CAL] Stereo lists: obj={len(obj_list_stereo)} img0={len(img0_list_stereo)} img1={len(img1_list_stereo)}")
+
+    print("[CAL] Calibrating stereo extrinsics (intrinsics & full distortion model fixed)...")
+    # Match mono model: Rational + Thin-Prism + Tilted
+    flags_st = (
+        cv2.CALIB_FIX_INTRINSIC
+        | cv2.CALIB_RATIONAL_MODEL
+        | cv2.CALIB_THIN_PRISM_MODEL
+        | cv2.CALIB_TILTED_MODEL
+    )
+    crit_st = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
     rms_st, K0_out, D0_out, K1_out, D1_out, R, T, E, F = cv2.stereoCalibrate(
         obj_list_stereo, img0_list_stereo, img1_list_stereo,
         K0, D0, K1, D1, image_size,
-        flags=flags,
-        criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
+        flags=flags_st,
+        criteria=crit_st,
     )
     print(f"[CAL] Stereo RMS: {rms_st:.3f}")
     print(f"[CAL] R:\n{R}")
     print(f"[CAL] T: {T.flatten()}")
+    # Sanity: verify intrinsics/distortion truly stayed fixed
+    try:
+        print("[CAL] K0_out change norm:", float(np.linalg.norm(K0_out - K0)))
+        print("[CAL] D0_out change norm:", float(np.linalg.norm(D0_out - D0)))
+        print("[CAL] K1_out change norm:", float(np.linalg.norm(K1_out - K1)))
+        print("[CAL] D1_out change norm:", float(np.linalg.norm(D1_out - D1)))
+    except Exception:
+        pass
     
     # Diagnostic overlays
     repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
