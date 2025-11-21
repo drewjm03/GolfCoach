@@ -674,6 +674,83 @@ def main():
             kept1 = [k for k, m in zip(kept1, keep_mask1) if m]
             obj1_list, img1_list = obj1_list2, img1_list2
     
+    # ----- Save mono diagnostic overlays (always, even if stereo fails later) -----
+    repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
+    out_dir = os.path.join(repo_root, "data")
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    diag_dir = os.path.join(out_dir, f"stereo_offline_diag_{stamp}")
+    os.makedirs(diag_dir, exist_ok=True)
+
+    # Best view indices per cam (by number of points)
+    best0_idx = _best_kept_index_stereo(acc, kept0, cam_idx=0) if kept0 else 0
+    best1_idx = _best_kept_index_stereo(acc, kept1, cam_idx=1) if kept1 else 0
+    view0_idx = kept0[best0_idx] if kept0 and best0_idx < len(kept0) else (kept0[0] if kept0 else 0)
+    view1_idx = kept1[best1_idx] if kept1 and best1_idx < len(kept1) else (kept1[0] if kept1 else 0)
+
+    # Find corresponding frames for the chosen best views
+    if frames0_by_view and 0 <= view0_idx < len(frames0_by_view):
+        frame0_bgr_diag = frames0_by_view[view0_idx]
+    else:
+        frame0_bgr_diag = keyframes[0][4]
+
+    if frames1_by_view and 0 <= view1_idx < len(frames1_by_view):
+        frame1_bgr_diag = frames1_by_view[view1_idx]
+    else:
+        frame1_bgr_diag = keyframes[0][5]
+
+    # Get best corners and ids
+    best_corners0 = acc.corners0[view0_idx] if view0_idx < len(acc.corners0) else acc.corners0[0]
+    best_ids0 = acc.ids0[view0_idx] if view0_idx < len(acc.ids0) else acc.ids0[0]
+    best_corners1 = acc.corners1[view1_idx] if view1_idx < len(acc.corners1) else acc.corners1[0]
+    best_ids1 = acc.ids1[view1_idx] if view1_idx < len(acc.ids1) else acc.ids1[0]
+
+    # Get corresponding rvec/tvec
+    rvec0_best = rvecs0[best0_idx] if best0_idx < len(rvecs0) else rvecs0[0]
+    tvec0_best = tvecs0[best0_idx] if best0_idx < len(tvecs0) else tvecs0[0]
+    rvec1_best = rvecs1[best1_idx] if best1_idx < len(rvecs1) else rvecs1[0]
+    tvec1_best = tvecs1[best1_idx] if best1_idx < len(tvecs1) else tvecs1[0]
+
+    # Save single best-view diagnostics
+    out_png0 = os.path.join(diag_dir, f"stereo_offline_cam0_diag_{stamp}.png")
+    _save_diag_pinhole(out_png0, frame0_bgr_diag, best_corners0, best_ids0, acc, K0, D0,
+                       rvec0_best, tvec0_best, r_cyan=8, r_mag=3)
+    print(f"[SAVE] Cam0 diagnostic -> {out_png0}")
+
+    out_png1 = os.path.join(diag_dir, f"stereo_offline_cam1_diag_{stamp}.png")
+    _save_diag_pinhole(out_png1, frame1_bgr_diag, best_corners1, best_ids1, acc, K1, D1,
+                       rvec1_best, tvec1_best, r_cyan=8, r_mag=3)
+    print(f"[SAVE] Cam1 diagnostic -> {out_png1}")
+
+    # Save overlays for all kept frames if requested
+    if args.save_all_diag:
+        for idx, (vi0, O0, I0) in enumerate(zip(kept0, obj0_list, img0_list)):
+            view_idx0 = vi0
+            if view_idx0 < len(acc.corners0):
+                corners0_here = acc.corners0[view_idx0]
+                ids0_here = acc.ids0[view_idx0]
+                if frames0_by_view and 0 <= view_idx0 < len(frames0_by_view):
+                    frame0_here = frames0_by_view[view_idx0]
+                else:
+                    frame0_here = frame0_bgr_diag
+                out_png_i = os.path.join(diag_dir, f"stereo_offline_cam0_diag_{stamp}_view{idx:03d}.png")
+                _save_diag_pinhole(out_png_i, frame0_here, corners0_here, ids0_here, acc, K0, D0,
+                                   rvecs0[idx], tvecs0[idx], r_cyan=8, r_mag=3)
+
+        for idx, (vi1, O1, I1) in enumerate(zip(kept1, obj1_list, img1_list)):
+            view_idx1 = vi1
+            if view_idx1 < len(acc.corners1):
+                corners1_here = acc.corners1[view_idx1]
+                ids1_here = acc.ids1[view_idx1]
+                if frames1_by_view and 0 <= view_idx1 < len(frames1_by_view):
+                    frame1_here = frames1_by_view[view_idx1]
+                else:
+                    frame1_here = frame1_bgr_diag
+                out_png_i = os.path.join(diag_dir, f"stereo_offline_cam1_diag_{stamp}_view{idx:03d}.png")
+                _save_diag_pinhole(out_png_i, frame1_here, corners1_here, ids1_here, acc, K1, D1,
+                                   rvecs1[idx], tvecs1[idx], r_cyan=8, r_mag=3)
+        print(f"[SAVE] Saved diagnostic overlays for all views to {diag_dir}")
+
     # Stereo calibration
     if len(acc.stereo_samples) < 5:
         print("[CAL] Not enough stereo samples; aborting stereo calibration.")
@@ -780,86 +857,6 @@ def main():
         print("[CAL] D1_out change norm:", float(np.linalg.norm(D1_out - D1)))
     except Exception:
         pass
-    
-    # Diagnostic overlays
-    repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
-    out_dir = os.path.join(repo_root, "data")
-    os.makedirs(out_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    # Put all diagnostic PNGs for this run into a dedicated subfolder
-    diag_dir = os.path.join(out_dir, f"stereo_offline_diag_{stamp}")
-    os.makedirs(diag_dir, exist_ok=True)
-    
-    # Best view indices
-    best0_idx = _best_kept_index_stereo(acc, kept0, cam_idx=0) if kept0 else 0
-    best1_idx = _best_kept_index_stereo(acc, kept1, cam_idx=1) if kept1 else 0
-    view0_idx = kept0[best0_idx] if best0_idx < len(kept0) else kept0[0] if kept0 else 0
-    view1_idx = kept1[best1_idx] if best1_idx < len(kept1) else kept1[0] if kept1 else 0
-    
-    # Find corresponding frames for the chosen best views
-    if frames0_by_view and 0 <= view0_idx < len(frames0_by_view):
-        frame0_bgr_diag = frames0_by_view[view0_idx]
-    else:
-        frame0_bgr_diag = keyframes[0][4]
-
-    if frames1_by_view and 0 <= view1_idx < len(frames1_by_view):
-        frame1_bgr_diag = frames1_by_view[view1_idx]
-    else:
-        frame1_bgr_diag = keyframes[0][5]
-    
-    # Get best corners and ids
-    best_corners0 = acc.corners0[view0_idx] if view0_idx < len(acc.corners0) else acc.corners0[0]
-    best_ids0 = acc.ids0[view0_idx] if view0_idx < len(acc.ids0) else acc.ids0[0]
-    best_corners1 = acc.corners1[view1_idx] if view1_idx < len(acc.corners1) else acc.corners1[0]
-    best_ids1 = acc.ids1[view1_idx] if view1_idx < len(acc.ids1) else acc.ids1[0]
-    
-    # Get corresponding rvec/tvec
-    rvec0_best = rvecs0[best0_idx] if best0_idx < len(rvecs0) else rvecs0[0]
-    tvec0_best = tvecs0[best0_idx] if best0_idx < len(tvecs0) else tvecs0[0]
-    rvec1_best = rvecs1[best1_idx] if best1_idx < len(rvecs1) else rvecs1[0]
-    tvec1_best = tvecs1[best1_idx] if best1_idx < len(tvecs1) else tvecs1[0]
-    
-    # Save diagnostic overlays
-    out_png0 = os.path.join(diag_dir, f"stereo_offline_cam0_diag_{stamp}.png")
-    _save_diag_pinhole(out_png0, frame0_bgr_diag, best_corners0, best_ids0, acc, K0, D0,
-                       rvec0_best, tvec0_best, r_cyan=8, r_mag=3)
-    print(f"[SAVE] Cam0 diagnostic -> {out_png0}")
-    
-    out_png1 = os.path.join(diag_dir, f"stereo_offline_cam1_diag_{stamp}.png")
-    _save_diag_pinhole(out_png1, frame1_bgr_diag, best_corners1, best_ids1, acc, K1, D1,
-                       rvec1_best, tvec1_best, r_cyan=8, r_mag=3)
-    print(f"[SAVE] Cam1 diagnostic -> {out_png1}")
-    
-    # Save overlays for all kept frames if requested
-    if args.save_all_diag:
-        for idx, (vi0, O0, I0) in enumerate(zip(kept0, obj0_list, img0_list)):
-            view_idx0 = vi0
-            if view_idx0 < len(acc.corners0):
-                corners0_here = acc.corners0[view_idx0]
-                ids0_here = acc.ids0[view_idx0]
-                # Frame corresponding to this mono view
-                if frames0_by_view and 0 <= view_idx0 < len(frames0_by_view):
-                    frame0_here = frames0_by_view[view_idx0]
-                else:
-                    frame0_here = frame0_bgr_diag
-                out_png_i = os.path.join(diag_dir, f"stereo_offline_cam0_diag_{stamp}_view{idx:03d}.png")
-                _save_diag_pinhole(out_png_i, frame0_here, corners0_here, ids0_here, acc, K0, D0,
-                                   rvecs0[idx], tvecs0[idx], r_cyan=8, r_mag=3)
-        
-        for idx, (vi1, O1, I1) in enumerate(zip(kept1, obj1_list, img1_list)):
-            view_idx1 = vi1
-            if view_idx1 < len(acc.corners1):
-                corners1_here = acc.corners1[view_idx1]
-                ids1_here = acc.ids1[view_idx1]
-                # Frame corresponding to this mono view
-                if frames1_by_view and 0 <= view_idx1 < len(frames1_by_view):
-                    frame1_here = frames1_by_view[view_idx1]
-                else:
-                    frame1_here = frame1_bgr_diag
-                out_png_i = os.path.join(diag_dir, f"stereo_offline_cam1_diag_{stamp}_view{idx:03d}.png")
-                _save_diag_pinhole(out_png_i, frame1_here, corners1_here, ids1_here, acc, K1, D1,
-                                   rvecs1[idx], tvecs1[idx], r_cyan=8, r_mag=3)
-        print(f"[SAVE] Saved diagnostic overlays for all views to {out_dir}")
     
     # Save calibration JSON
     out_json = os.path.join(out_dir, f"stereo_offline_calibration_{stamp}.json")
