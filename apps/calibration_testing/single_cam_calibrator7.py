@@ -358,6 +358,10 @@ def _save_diag_pinhole(path_png, frame_bgr, corners, ids, acc, K, D, rvec, tvec,
         cv2.circle(img, tuple(np.int32(det_center)), int(r_cyan), (255,255,0), -1)  # cyan (detected center)
         # projected center in black for contrast
         cv2.circle(img, tuple(np.int32(proj_center)), max(3, int(r_mag+1)), (0,0,0), -1)  # black (projected center)
+        # label tag id near detected center
+        cv2.putText(img, str(tid),
+                    (int(det_center[0]) + 8, int(det_center[1]) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
         if draw_corners:
             p_ctr = tuple(np.int32(proj_center))
             for k in range(4):

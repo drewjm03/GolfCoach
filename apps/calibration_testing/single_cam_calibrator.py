@@ -134,6 +134,10 @@ def _save_diagnostic_image(path_png, frame_bgr, corners, ids, acc, K, D, rvec=No
 		         (int(round(det_center[0])), int(round(det_center[1]))),
 		         (int(round(proj_center[0])), int(round(proj_center[1]))),
 		         (0, 180, 255), 1)
+			# label tag id near detected center
+			cv2.putText(img, str(tag_id),
+			            (int(round(det_center[0])) + 8, int(round(det_center[1])) - 8),
+			            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
 	cv2.putText(img, "Cyan=detected centers, Magenta=reprojected centers",
 	            (16, img.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)

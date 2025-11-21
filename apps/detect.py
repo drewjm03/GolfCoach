@@ -142,6 +142,9 @@ class CalibrationAccumulator:
             obj_points = self.board.getObjPoints()
             for idx, tag_id in enumerate(ids):
                 obj = np.array(obj_points[idx], dtype=np.float32).reshape(-1, 3)
+                # If corner_order_override is set, reorder the board's object points to match
+                if self.corner_order_override is not None:
+                    obj = obj[self.corner_order_override, :]
                 id_to_obj[int(tag_id)] = obj
         except Exception as e:
             N = config.TAGS_X * config.TAGS_Y
@@ -149,6 +152,9 @@ class CalibrationAccumulator:
                 obj_points = self.board.getObjPoints()
                 for idx in range(N):
                     obj = np.array(obj_points[idx], dtype=np.float32).reshape(-1, 3)
+                    # If corner_order_override is set, reorder the board's object points to match
+                    if self.corner_order_override is not None:
+                        obj = obj[self.corner_order_override, :]
                     id_to_obj[idx] = obj
             except Exception as inner_e:
                 print(f"[ERROR] Could not get object points: {inner_e}")
