@@ -155,7 +155,17 @@ def _ground_plane_from_live_capture(
 	H, W = frame0.shape[:2]
 	image_size = (W, H)
 
-	# Build board + accumulator to reuse the same board model + id_to_obj mapping
+	# For floor tags: use individual tags (no board layout)
+	# Use floor tag size if provided, otherwise fall back to regular tag size
+	floor_tag_size = args.floor_tag_size_m if args.floor_tag_size_m is not None else args.harvard_tag_size_m
+	if floor_tag_size is None:
+		print("[GROUND][ERR] Floor tag size required (--floor-tag-size-m or --harvard-tag-size-m)")
+		for c in cams:
+			c.release()
+		return None
+
+	# Create a dummy board for the accumulator (needed for detection backend)
+	# But we'll create object points dynamically for each detected tag
 	board = load_board(
 		board_source=args.board_source,
 		april_pickle=args.april_pickle,
@@ -191,6 +201,22 @@ def _ground_plane_from_live_capture(
 		disable_corner_autoreorder=disable_autoreorder,
 	)
 	print("[GROUND][APRIL] Backend:", acc.get_backend_name())
+
+	# Create object points for individual tags based on floor tag size
+	# Tag corners in local frame (centered at origin, Z=0): standard order
+	tag_half = float(floor_tag_size) * 0.5
+	tag_obj_points_base = np.array([
+		[-tag_half, -tag_half, 0.0],  # corner 0
+		[ tag_half, -tag_half, 0.0],  # corner 1
+		[ tag_half,  tag_half, 0.0],  # corner 2
+		[-tag_half,  tag_half, 0.0],  # corner 3
+	], dtype=np.float32)
+	
+	# Apply corner order override if specified
+	if corner_order_override is not None:
+		tag_obj_points_base = tag_obj_points_base[corner_order_override, :]
+	
+	print(f"[GROUND] Using individual floor tags with size {floor_tag_size:.4f}m")
 
 	# Intrinsics from offline calibration
 	try:
@@ -230,18 +256,18 @@ def _ground_plane_from_live_capture(
 			gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
 			corners0, ids0 = acc.detect(gray0)
 			n_tags = 0 if ids0 is None else len(ids0)
-			if ids0 is None or not corners0 or n_tags < getattr(config, "MIN_MARKERS_PER_VIEW", 6):
-				print(f"[GROUND] View {collected+1}: not enough tags (have {n_tags}); skipping")
+			if ids0 is None or not corners0 or n_tags < 4:
+				print(f"[GROUND] View {collected+1}: not enough tags (have {n_tags}, need 4); skipping")
 				continue
 
 			# Build per-tag object/image corner lists
+			# For floor tags: create object points dynamically for each detected tag
 			obj_list: List[np.ndarray] = []
 			img_list: List[np.ndarray] = []
 			for c, iv in zip(corners0, ids0):
 				tid = int(iv[0])
-				if tid not in acc.id_to_obj:
-					continue
-				obj_list.append(acc.id_to_obj[tid].reshape(4, 3))
+				# Use floor tag object points (same for all tags since they're individual)
+				obj_list.append(tag_obj_points_base.copy())
 				img_list.append(c.reshape(4, 2))
 			if not obj_list:
 				print(f"[GROUND] View {collected+1}: no mappable tags; skipping")
@@ -380,6 +406,8 @@ def main():
 	                    help="Tag side length in meters (Harvard board).")
 	parser.add_argument("--harvard-tag-spacing-m", type=float, default=None,
 	                    help="Tag spacing in meters (Harvard board, optional; improves scaling from centers data).")
+	parser.add_argument("--floor-tag-size-m", type=float, default=None,
+	                    help="Tag side length in meters for floor calibration (individual tags, not a board).")
 	parser.add_argument("--corner-order", type=str, default=None,
 	                    help="Corner order override 'i0,i1,i2,i3' (only applicable to grid8x5).")
 	# Recording
