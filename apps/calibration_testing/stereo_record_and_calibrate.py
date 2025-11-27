@@ -29,14 +29,16 @@ try:
 	from .. import config
 	from ..capture import CamReader
 	from ..detect import CalibrationAccumulator
-	from ..stereo_calib_plot import load_board, solve_pnp_for_view
+	from ..stereo_calib_plot import load_board
+	from ..triangulation import StereoTriangulator
 except Exception:
 	# Fallback when run as a script
 	sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 	from apps import config  # type: ignore
 	from apps.capture import CamReader  # type: ignore
 	from apps.detect import CalibrationAccumulator  # type: ignore
-	from apps.stereo_calib_plot import load_board, solve_pnp_for_view  # type: ignore
+	from apps.stereo_calib_plot import load_board  # type: ignore
+	from apps.triangulation import StereoTriangulator  # type: ignore
 
 
 def _repo_root() -> str:
@@ -202,28 +204,27 @@ def _ground_plane_from_live_capture(
 	)
 	print("[GROUND][APRIL] Backend:", acc.get_backend_name())
 
-	# Create object points for individual tags based on floor tag size
-	# Tag corners in local frame (centered at origin, Z=0): standard order
-	tag_half = float(floor_tag_size) * 0.5
-	tag_obj_points_base = np.array([
-		[-tag_half, -tag_half, 0.0],  # corner 0
-		[ tag_half, -tag_half, 0.0],  # corner 1
-		[ tag_half,  tag_half, 0.0],  # corner 2
-		[-tag_half,  tag_half, 0.0],  # corner 3
-	], dtype=np.float32)
-	
-	# Apply corner order override if specified
-	if corner_order_override is not None:
-		tag_obj_points_base = tag_obj_points_base[corner_order_override, :]
-	
 	print(f"[GROUND] Using individual floor tags with size {floor_tag_size:.4f}m")
 
-	# Intrinsics from offline calibration
+	# Intrinsics and stereo extrinsics from offline calibration
 	try:
 		K0 = np.asarray(calib_meta["K0"], dtype=np.float64)
 		D0 = np.asarray(calib_meta["D0"], dtype=np.float64)
+		K1 = np.asarray(calib_meta["K1"], dtype=np.float64)
+		D1 = np.asarray(calib_meta["D1"], dtype=np.float64)
+		R_st = np.asarray(calib_meta["R"], dtype=np.float64)
+		T_st = np.asarray(calib_meta["T"], dtype=np.float64)
 	except Exception as e:
-		print(f"[GROUND][ERR] Failed to read K0/D0 from calibration JSON: {e}")
+		print(f"[GROUND][ERR] Failed to read K0/D0/K1/D1/R/T from calibration JSON: {e}")
+		for c in cams:
+			c.release()
+		return None
+
+	# Stereo triangulator: outputs points in cam0 frame (matches ground plane)
+	try:
+		triangulator = StereoTriangulator(K0, D0, K1, D1, R_st, T_st, image_size)
+	except Exception as e:
+		print(f"[GROUND][ERR] Failed to initialize StereoTriangulator: {e}")
 		for c in cams:
 			c.release()
 		return None
@@ -243,6 +244,7 @@ def _ground_plane_from_live_capture(
 		while collected < target_views:
 			try:
 				ts0, frame0 = cams[0].latest()
+				ts1, frame1 = cams[1].latest()
 			except queue.Empty:
 				time.sleep(0.01)
 				continue
@@ -254,43 +256,51 @@ def _ground_plane_from_live_capture(
 			last_capture = now
 
 			gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+			gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+
+			# Detect tags in both cameras
 			corners0, ids0 = acc.detect(gray0)
-			n_tags = 0 if ids0 is None else len(ids0)
-			if ids0 is None or not corners0 or n_tags < 4:
-				print(f"[GROUND] View {collected+1}: not enough tags (have {n_tags}, need 4); skipping")
+			corners1, ids1 = acc.detect(gray1)
+
+			n0 = 0 if ids0 is None else len(ids0)
+			n1 = 0 if ids1 is None else len(ids1)
+			if ids0 is None or ids1 is None or not corners0 or not corners1:
+				print(f"[GROUND] View {collected+1}: no stereo tags (cam0={n0}, cam1={n1}); skipping")
 				continue
 
-			# For each detected tag, solve a well-posed PnP on a single square.
-			valid_tag_count = 0
-			for c, iv in zip(corners0, ids0):
-				# 4×3 object points for a single tag, Z=0 plane
-				obj = tag_obj_points_base  # shape (4,3)
-				img = c.reshape(4, 2)
+			# Build per-tag corner maps for stereo matching
+			map0 = {int(i[0]): c.reshape(4, 2) for c, i in zip(corners0, ids0)}
+			map1 = {int(i[0]): c.reshape(4, 2) for c, i in zip(corners1, ids1)}
+			common = sorted(set(map0.keys()) & set(map1.keys()))
 
-				ok, rvec, tvec = cv2.solvePnP(
-					obj, img, K0, D0,
-					flags=cv2.SOLVEPNP_IPPE_SQUARE,  # strongly recommended for a single square
-				)
-				if not ok:
+			if len(common) < 4:
+				print(f"[GROUND] View {collected+1}: not enough common stereo tags (have {len(common)}, need 4); skipping")
+				continue
+
+			valid_tag_count = 0
+
+			# Triangulate all four corners of each common tag using stereo
+			for tid in common:
+				pts0_px = map0[tid].astype(np.float32)  # (4,2)
+				pts1_px = map1[tid].astype(np.float32)  # (4,2)
+
+				# Convert pixel coords to normalized [0,1] for StereoTriangulator
+				pts0_norm = np.empty_like(pts0_px)
+				pts1_norm = np.empty_like(pts1_px)
+				pts0_norm[:, 0] = pts0_px[:, 0] / float(W)
+				pts0_norm[:, 1] = pts0_px[:, 1] / float(H)
+				pts1_norm[:, 0] = pts1_px[:, 0] / float(W)
+				pts1_norm[:, 1] = pts1_px[:, 1] / float(H)
+
+				pts_cam = triangulator.triangulate(pts0_norm, pts1_norm)  # (4,3) in cam0 frame
+				if pts_cam is None or pts_cam.shape[0] == 0:
 					continue
 
-				R, _ = cv2.Rodrigues(rvec)
-				t = tvec.reshape(3)
-
-				# Transform this tag's corners to camera frame
-				pts_cam = (R @ obj.T + t[:, None]).T  # (4,3) in cam0
 				all_pts_cam.append(pts_cam)
 				valid_tag_count += 1
 
-				# Optional per-tag normal (board Z axis in camera frame)
-				n_view = R[:, 2].astype(np.float64)
-				n_view_norm = np.linalg.norm(n_view)
-				if n_view_norm > 0:
-					n_view /= n_view_norm
-					normals.append(n_view)
-
 			if valid_tag_count == 0:
-				print(f"[GROUND] View {collected+1}: per-tag solvePnP failed for all tags; skipping")
+				print(f"[GROUND] View {collected+1}: stereo triangulation failed for all tags; skipping")
 				continue
 
 			# Simple diagnostic image with projected points
@@ -304,7 +314,7 @@ def _ground_plane_from_live_capture(
 				pass
 
 			collected += 1
-			print(f"[GROUND] Collected {collected}/{target_views} valid ground views (tags={n_tags})")
+			print(f"[GROUND] Collected {collected}/{target_views} valid ground views")
 	finally:
 		for c in cams:
 			c.release()
