@@ -106,8 +106,19 @@ class Viewer3D:
         plane_mesh = o3d.geometry.TriangleMesh()
         plane_mesh.vertices = o3d.utility.Vector3dVector(vertices)
         plane_mesh.triangles = o3d.utility.Vector3iVector(triangles)
+        
+        # Add triangles for the back side (reverse winding order)
+        triangles_back = [[0, 2, 1], [0, 3, 2]]
+        all_triangles = triangles + triangles_back
+        plane_mesh.triangles = o3d.utility.Vector3iVector(all_triangles)
+        
         plane_mesh.compute_vertex_normals()
         plane_mesh.paint_uniform_color([0.5, 0.5, 0.5])  # Gray
+        
+        # Make the mesh double-sided by ensuring normals are computed correctly
+        # and the material renders both sides
+        plane_mesh.compute_triangle_normals()
+        plane_mesh.compute_vertex_normals()
         
         self.vis.add_geometry(plane_mesh)
         self.ground_plane_mesh = plane_mesh

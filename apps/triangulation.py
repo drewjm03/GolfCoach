@@ -22,7 +22,9 @@ class StereoTriangulator:
             K1: Camera 1 intrinsic matrix (3x3)
             D1: Camera 1 distortion coefficients
             R: Rotation matrix from cam0 to cam1 (3x3)
+                Note: OpenCV stereoCalibrate returns R such that X_cam1 = R @ X_cam0 + T
             T: Translation vector from cam0 to cam1 (3,)
+                Note: T is in cam0 frame
             image_size: (width, height) tuple
         """
         self.K0 = np.asarray(K0, dtype=np.float64)
@@ -33,11 +35,24 @@ class StereoTriangulator:
         self.T = np.asarray(T, dtype=np.float64).reshape(3, 1)
         self.image_size = tuple(image_size)
         
-        # Compute projection matrices
-        # P0: cam0 projection (identity rotation/translation)
+        # Compute projection matrices for triangulation
+        # OpenCV stereoCalibrate convention:
+        #   R: rotation from cam0 to cam1 (X_cam1 = R @ X_cam0 + T)
+        #   T: translation from cam0 to cam1 (in cam0 frame)
+        # 
+        # For cv2.triangulatePoints(P0, P1, pts0, pts1):
+        #   P0 = K0 @ [I | 0]  (cam0 is reference frame, points output in cam0)
+        #   P1 = K1 @ [R | T]  (cam1 relative to cam0)
+        # 
+        # This gives triangulated points in cam0 frame, matching the ground plane.
+        # Both ground plane (from _ground_plane_from_live_capture) and triangulated
+        # points should be in cam0 frame.
+        # 
+        # NOTE: If skeleton and ground plane don't align, verify:
+        #   1. R, T convention matches OpenCV stereoCalibrate (cam0 -> cam1)
+        #   2. Ground plane is computed in cam0 frame (it is, using K0, D0)
+        #   3. No rectification is applied (we use original K, D, not rectified)
         self.P0 = self.K0 @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        
-        # P1: cam1 projection (R, T relative to cam0)
         self.P1 = self.K1 @ np.hstack([self.R, self.T])
         
         # Pre-compute rectification maps if needed (for undistortion)

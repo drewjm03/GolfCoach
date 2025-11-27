@@ -320,9 +320,11 @@ def _ground_plane_from_live_capture(
 		print(f"[GROUND][ERR] Plane fit failed: {e}")
 		return None
 
-	# Flip normal, if needed, so that it roughly points "up" (positive Y) if possible.
-	# This is heuristic and only affects sign, not the plane itself.
-	if abs(n[1]) > 1e-3 and n[1] < 0:
+	# Flip normal, if needed, so that it points "up" (positive Y direction).
+	# Check: if normal · [0,1,0] < 0, flip normal and d.
+	world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+	dot_product = np.dot(n, world_up)
+	if dot_product < 0:
 		n = -n
 		d = -d
 
