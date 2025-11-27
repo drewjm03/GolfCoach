@@ -260,38 +260,38 @@ def _ground_plane_from_live_capture(
 				print(f"[GROUND] View {collected+1}: not enough tags (have {n_tags}, need 4); skipping")
 				continue
 
-			# Build per-tag object/image corner lists
-			# For floor tags: create object points dynamically for each detected tag
-			obj_list: List[np.ndarray] = []
-			img_list: List[np.ndarray] = []
+			# For each detected tag, solve a well-posed PnP on a single square.
+			valid_tag_count = 0
 			for c, iv in zip(corners0, ids0):
-				tid = int(iv[0])
-				# Use floor tag object points (same for all tags since they're individual)
-				obj_list.append(tag_obj_points_base.copy())
-				img_list.append(c.reshape(4, 2))
-			if not obj_list:
-				print(f"[GROUND] View {collected+1}: no mappable tags; skipping")
+				# 4×3 object points for a single tag, Z=0 plane
+				obj = tag_obj_points_base  # shape (4,3)
+				img = c.reshape(4, 2)
+
+				ok, rvec, tvec = cv2.solvePnP(
+					obj, img, K0, D0,
+					flags=cv2.SOLVEPNP_IPPE_SQUARE,  # strongly recommended for a single square
+				)
+				if not ok:
+					continue
+
+				R, _ = cv2.Rodrigues(rvec)
+				t = tvec.reshape(3)
+
+				# Transform this tag's corners to camera frame
+				pts_cam = (R @ obj.T + t[:, None]).T  # (4,3) in cam0
+				all_pts_cam.append(pts_cam)
+				valid_tag_count += 1
+
+				# Optional per-tag normal (board Z axis in camera frame)
+				n_view = R[:, 2].astype(np.float64)
+				n_view_norm = np.linalg.norm(n_view)
+				if n_view_norm > 0:
+					n_view /= n_view_norm
+					normals.append(n_view)
+
+			if valid_tag_count == 0:
+				print(f"[GROUND] View {collected+1}: per-tag solvePnP failed for all tags; skipping")
 				continue
-
-			rvec, tvec = solve_pnp_for_view(K0, D0, obj_list, img_list)
-			if rvec is None or tvec is None:
-				print(f"[GROUND] View {collected+1}: solvePnP failed; skipping")
-				continue
-
-			R, _ = cv2.Rodrigues(rvec)
-			t = tvec.reshape(3,)
-
-			# Transform all board points to camera frame
-			obj_cat = np.concatenate(obj_list, axis=0)  # (N,3)
-			pts_cam = (R @ obj_cat.T + t.reshape(3, 1)).T  # (N,3)
-			all_pts_cam.append(pts_cam)
-
-			# Per-view normal (board Z axis in camera frame)
-			n_view = R[:, 2].astype(np.float64)
-			n_view_norm = np.linalg.norm(n_view)
-			if n_view_norm > 0:
-				n_view /= n_view_norm
-				normals.append(n_view)
 
 			# Simple diagnostic image with projected points
 			try:
