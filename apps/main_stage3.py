@@ -24,6 +24,7 @@ try:
     from .filtering import OneEuroFilter3D
     from .viewer3d import Viewer3D, HAVE_OPEN3D
     from .mesh_estimator import MeshEstimator
+    from .smpl_fitter import SMPLFitter, FitterConfig, RTM_TO_SMPLX
 except Exception:  # pragma: no cover - fallback when run as script
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from apps import config  # type: ignore
@@ -33,6 +34,7 @@ except Exception:  # pragma: no cover - fallback when run as script
     from apps.filtering import OneEuroFilter3D  # type: ignore
     from apps.viewer3d import Viewer3D, HAVE_OPEN3D  # type: ignore
     from apps.mesh_estimator import MeshEstimator  # type: ignore
+    from apps.smpl_fitter import SMPLFitter, FitterConfig, RTM_TO_SMPLX  # type: ignore
 
 
 def load_rig_config(config_path: str):
@@ -176,15 +178,32 @@ def main() -> None:
     # 3D filter (initialized lazily)
     filter_3d: Optional[OneEuroFilter3D] = None  # type: ignore[type-arg]
 
-    # Mesh estimator (optional, stub)
+    # Mesh estimator + SMPL fitter (optional)
     mesh_estimator: Optional[MeshEstimator] = None  # type: ignore[type-arg]
+    smpl_fitter: Optional[SMPLFitter] = None  # type: ignore[type-arg]
     if args.smpl_model is not None:
         try:
             mesh_estimator = MeshEstimator(args.smpl_model, device="cpu")
-            print("[MAIN] MeshEstimator initialized (stub).")
+            print("[MAIN] MeshEstimator initialized.")
+            # Use the same SMPLModel instance inside the fitter
+            joint_map = RTM_TO_SMPLX
+            smpl_fitter = SMPLFitter(
+                mesh_estimator.model,
+                joint_map=joint_map,
+                device="cpu",
+                config=FitterConfig(
+                    lr=5e-2,
+                    num_iters=10,
+                    pose_reg=1e-3,
+                    betas_reg=1e-4,
+                    optimize_betas=False,
+                ),
+            )
+            print("[MAIN] SMPLFitter initialized.")
         except Exception as e:
-            print(f"[WARN] Failed to initialize MeshEstimator: {e}")
+            print(f"[WARN] Failed to initialize MeshEstimator/SMPLFitter: {e}")
             mesh_estimator = None
+            smpl_fitter = None
 
     # 3D viewer
     print("[MAIN] Initializing 3D viewer…")
@@ -245,18 +264,22 @@ def main() -> None:
                     # Update skeleton
                     viewer.update_skeleton(keypoints_3d_filtered)
 
-                    # Mesh estimation (stub) and visualization
+                    # Mesh estimation / SMPL fitting and visualization
                     if mesh_estimator is not None:
                         try:
-                            verts_world, faces = mesh_estimator.estimate_mesh(
-                                keypoints_3d_filtered
-                            )
-                            viewer.update_mesh(verts_world, faces)
-                        except NotImplementedError:
-                            # SMPL fitting not implemented yet
-                            pass
+                            if smpl_fitter is not None:
+                                # Build validity mask from finite joints
+                                valid_mask = np.isfinite(keypoints_3d_filtered).all(axis=1)
+                                verts_world, _ = smpl_fitter.fit(
+                                    keypoints_3d_filtered, valid_mask=valid_mask
+                                )
+                            else:
+                                verts_world, _ = mesh_estimator.estimate_mesh(
+                                    keypoints_3d_filtered
+                                )
+                            viewer.update_mesh(verts_world, mesh_estimator.faces)
                         except Exception as e:
-                            print(f"[WARN] Mesh estimation failed: {e}")
+                            print(f"[WARN] Mesh estimation / fitting failed: {e}")
 
             # Update viewer
             viewer.update()
