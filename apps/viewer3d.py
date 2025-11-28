@@ -40,6 +40,7 @@ class Viewer3D:
         self.skeleton_points = None
         self.ground_plane_mesh = None
         self.axes = None
+        self.mesh = None  # optional SMPL mesh
         
         # Initialize scene
         self._setup_scene()
@@ -178,6 +179,58 @@ class Viewer3D:
         
         self.skeleton_points = points
         self.vis.add_geometry(points, reset_bounding_box=False)
+    
+    def update_mesh(self, vertices_world, faces):
+        """Update/add SMPL mesh in world coordinates.
+
+        Args:
+            vertices_world: (N, 3) numpy array in same frame as 3D skeleton
+            faces:          (F, 3) int triangle indices
+        """
+        if vertices_world is None or faces is None:
+            return
+
+        vertices_world = np.asarray(vertices_world, dtype=np.float64)
+        faces = np.asarray(faces, dtype=np.int32)
+
+        # Remove old mesh if it exists
+        if self.mesh is not None:
+            self.vis.remove_geometry(self.mesh, reset_bounding_box=False)
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices_world)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color([0.7, 0.7, 0.9])  # light bluish
+
+        self.mesh = mesh
+        self.vis.add_geometry(mesh, reset_bounding_box=False)
+    
+    def update_mesh(self, vertices_world, faces):
+        """Update/add SMPL mesh in world coordinates.
+
+        Args:
+            vertices_world: (N, 3) numpy array in same frame as 3D skeleton
+            faces:          (F, 3) int triangle indices
+        """
+        if vertices_world is None or faces is None:
+            return
+
+        vertices_world = np.asarray(vertices_world, dtype=np.float64)
+        faces = np.asarray(faces, dtype=np.int32)
+
+        # Remove old mesh if it exists
+        if self.mesh is not None:
+            self.vis.remove_geometry(self.mesh, reset_bounding_box=False)
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices_world)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color([0.7, 0.7, 0.9])  # light bluish
+
+        self.mesh = mesh
+        self.vis.add_geometry(mesh, reset_bounding_box=False)
     
     def update(self):
         """Update the visualization (call in main loop)."""
