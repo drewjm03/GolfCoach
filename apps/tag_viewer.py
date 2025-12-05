@@ -106,6 +106,13 @@ def main():
     print("[APRIL] Backend:", acc.get_backend_name())
     print("[APRIL] Families:", acc._apriltag_family_string())
 
+    # Directory for saving recorded video streams
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    frames_dir = os.path.join(project_root, "data", "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    recording = False
+    writers = {}  # cam_idx -> cv2.VideoWriter
+
     win = "Tag Viewer"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
@@ -157,6 +164,16 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 annotated.append(vis)
 
+            # If recording, write raw frames from each camera
+            if recording:
+                for cam_idx, frame in zip(cam_indices, frames):
+                    writer = writers.get(cam_idx, None)
+                    if writer is not None:
+                        try:
+                            writer.write(frame)
+                        except Exception as e:
+                            print(f"[VIEW][WARN] Failed to write frame for cam{cam_idx}: {e}")
+
             # Compose output canvas (stack horizontally or vertically depending on number of cams)
             if len(annotated) == 1:
                 canvas = annotated[0]
@@ -173,12 +190,53 @@ def main():
 
             cv2.imshow(win, canvas)
             k = cv2.waitKey(1) & 0xFF
+
+            if k == ord("r"):
+                # Toggle recording of synchronized video streams
+                if not recording:
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    fps = getattr(config, "CAPTURE_FPS", 30)
+                    writers.clear()
+                    for cam_idx, frame in zip(cam_indices, frames):
+                        h, w = frame.shape[:2]
+                        fname = f"record_{timestamp}_cam{cam_idx}.mp4"
+                        out_path = os.path.join(frames_dir, fname)
+                        try:
+                            writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+                            if not writer.isOpened():
+                                print(f"[VIEW][WARN] Failed to open writer for cam{cam_idx}: {out_path}")
+                                continue
+                            writers[cam_idx] = writer
+                            print(f"[VIEW] Started recording cam{cam_idx} -> {out_path}")
+                        except Exception as e:
+                            print(f"[VIEW][WARN] Failed to create writer for cam{cam_idx}: {e}")
+                    recording = len(writers) > 0
+                    if not recording:
+                        print("[VIEW][WARN] No video writers started; recording disabled.")
+                else:
+                    # Stop recording and close writers
+                    for cam_idx, writer in list(writers.items()):
+                        try:
+                            writer.release()
+                            print(f"[VIEW] Stopped recording cam{cam_idx}")
+                        except Exception:
+                            pass
+                    writers.clear()
+                    recording = False
+
             if k in (27, ord("q")):
                 print("[VIEW] Quit.")
                 break
     finally:
+        # Clean up cameras and any active writers
         for c in cams:
             c.release()
+        for writer in writers.values():
+            try:
+                writer.release()
+            except Exception:
+                pass
         cv2.destroyAllWindows()
         print("[VIEW] Closed.")
 
