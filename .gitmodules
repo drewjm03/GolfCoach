@@ -1,3 +1,6 @@
 [submodule "third_party/golfpose"]
 	path = third_party/golfpose
 	url = https://github.com/MingHanLee/GolfPose.git
+[submodule "third_party/4d_humans"]
+	path = third_party/4d_humans
+	url = https://github.com/shubham-goel/4D-Humans.git

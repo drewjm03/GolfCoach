@@ -2,8 +2,29 @@
 data/**/*.mp4
 data/**/*.MP4
 apps/v6_recorder_mac.py
-.venv/
 body_models/smplx/
 
+# Virtual environments
+.venv/
+.venv311/
+venv/
+env/
+.venv_golfpose/
+
+data/**/*.png
+data/**/*.json
+
+*.pth
 
 
+__init__.py
+
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+**/__pycache__/
+
+third_party/4d_humans/data/
+
+third_party/4d_humans/outputs/

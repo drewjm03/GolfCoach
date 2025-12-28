@@ -1,7 +1,7 @@
 import cv2
 
 # ---------- Tunable constants ----------
-CAPTURE_FPS = 60
+CAPTURE_FPS = 120
 MAX_COMBINED_WIDTH = 1920
 FIRST_FRAME_RETRY_COUNT = 5
 WB_TOGGLE_DELAY_S = 0.075
@@ -10,7 +10,8 @@ DEBUG_PROBES = False        # gate expensive probe/smoke helpers
 
 # Exposure/gain defaults
 USE_SDK_EXPOSURE = False
-DEFAULT_EXPOSURE_STEP = -7
+# UVC exposure "step" value: more negative = darker, more positive = brighter.
+DEFAULT_EXPOSURE_STEP = -8
 MIN_EXPOSURE_STEP = -14
 MAX_EXPOSURE_STEP = 0
 MIN_EXPOSURE_US = 50
