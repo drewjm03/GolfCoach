@@ -44,22 +44,15 @@ from golfcoach.pose3d.render_silhouette_pytorch3d import render_silhouette
 
 def _default_smplx_model_path() -> Path:
     """
-    Heuristic to find the default SMPL model shipped with this repo.
+    Heuristic to find the default SMPL-X model shipped with this repo.
 
     We expect:
-        body_models/smpl/SMPL_NEUTRAL.pkl
+        body_models/smplx/SMPLX_NEUTRAL.npz
     at the project root.
     """
     here = Path(__file__).resolve()
     root = here.parents[2]
-    candidates = [
-        root / "body_models" / "smpl" / "basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    # Return the primary expected path so the error message is informative
-    return candidates[0]
+    return root / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
 
 
 def _estimate_initial_translation_cam0(
@@ -345,8 +338,8 @@ def fit_smpl_silhouette_stereo(
     smpl_model_path = _default_smplx_model_path()
     if not smpl_model_path.exists():
         raise FileNotFoundError(
-            f"Default SMPL model not found at {smpl_model_path}. "
-            "Place SMPL_NEUTRAL.pkl under body_models/smpl (or model_models/smpl)."
+            f"Default SMPL-X model not found at {smpl_model_path}. "
+            "Place SMPLX_NEUTRAL.npz under body_models/smplx."
         )
 
     smpl_wrapper = SMPLModel(str(smpl_model_path), device=device)
@@ -412,6 +405,12 @@ def fit_smpl_silhouette_stereo(
             global_orient=global_orient,
             body_pose=body_pose_flat,
             transl=trans_cam0,
+            left_hand_pose=torch.zeros((Tcur, 45), dtype=torch.float32, device=dev),
+            right_hand_pose=torch.zeros((Tcur, 45), dtype=torch.float32, device=dev),
+            jaw_pose=torch.zeros((Tcur, 3), dtype=torch.float32, device=dev),
+            leye_pose=torch.zeros((Tcur, 3), dtype=torch.float32, device=dev),
+            reye_pose=torch.zeros((Tcur, 3), dtype=torch.float32, device=dev),
+            expression=torch.zeros((Tcur, 10), dtype=torch.float32, device=dev),
             pose2rot=True,
         )
         verts_cam0 = out.vertices  # (T, V, 3)

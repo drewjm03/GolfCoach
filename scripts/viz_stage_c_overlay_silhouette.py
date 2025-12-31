@@ -101,6 +101,12 @@ def _build_smpl_sequence(
         global_orient=glob_t,
         body_pose=body_flat,
         transl=trans_t,
+        left_hand_pose=torch.zeros((T, 45), dtype=torch.float32, device=device),
+        right_hand_pose=torch.zeros((T, 45), dtype=torch.float32, device=device),
+        jaw_pose=torch.zeros((T, 3), dtype=torch.float32, device=device),
+        leye_pose=torch.zeros((T, 3), dtype=torch.float32, device=device),
+        reye_pose=torch.zeros((T, 3), dtype=torch.float32, device=device),
+        expression=torch.zeros((T, 10), dtype=torch.float32, device=device),
         pose2rot=True,
     )
     verts_cam0 = out.vertices  # (T,V,3)

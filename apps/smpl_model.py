@@ -73,7 +73,7 @@ class SMPLModel(nn.Module):
         # Create SMPL-X model
         self.smpl = smplx.create(
             model_path=model_dir,
-            model_type="smpl",
+            model_type="smplx",
             gender="neutral",
             use_pca=False,
             batch_size=1,
@@ -126,11 +126,22 @@ class SMPLModel(nn.Module):
         global_orient = pose_t[:, :3]
         body_pose = pose_t[:, 3:]
 
+        B = betas_t.shape[0]
+        zeros_45 = torch.zeros((B, 45), dtype=torch.float32, device=self.device)
+        zeros_3 = torch.zeros((B, 3), dtype=torch.float32, device=self.device)
+        zeros_expr = torch.zeros((B, 10), dtype=torch.float32, device=self.device)
+
         out = self.smpl(
             betas=betas_t,
             global_orient=global_orient,
             body_pose=body_pose,
             transl=transl_t,
+            left_hand_pose=zeros_45,
+            right_hand_pose=zeros_45,
+            jaw_pose=zeros_3,
+            leye_pose=zeros_3,
+            reye_pose=zeros_3,
+            expression=zeros_expr,
             pose2rot=True,
         )
 
