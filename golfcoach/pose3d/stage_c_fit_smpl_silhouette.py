@@ -304,6 +304,12 @@ def fit_smpl_silhouette_stereo(
         else:
             print("mL_rle type:", type(mL_rle))
 
+
+        print("mL_rle is list, len =", len(mL_rle))
+        print("first elem type =", type(mL_rle[0]))
+        if isinstance(mL_rle[0], (list, tuple)) and len(mL_rle[0]) > 0:
+            print("first elem[0] type =", type(mL_rle[0][0]))
+
         mL = decode_phalp_mask(mL_rle)
         mR = decode_phalp_mask(mR_rle)
 
