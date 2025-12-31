@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Tuple, Optional
 import os
+import shutil
+import glob
 
 import numpy as np
 import torch
@@ -35,6 +37,38 @@ class SMPLModel(nn.Module):
         base = os.path.basename(model_dir).lower()
         if base in {"smplx", "smpl", "smplh", "smpla"}:
             model_dir = os.path.dirname(model_dir)
+
+        # Ensure expected SMPL file exists; if not, try to adapt common filenames
+        expected_smpl = os.path.join(model_dir, "smpl", "SMPL_NEUTRAL.pkl")
+        if not os.path.exists(expected_smpl):
+            # Search common alternative names/locations and copy into expected path
+            project_root = os.path.dirname(model_dir)
+            alt_dirs = [
+                os.path.join(model_dir, "smpl"),
+                os.path.join(project_root, "model_models", "smpl"),
+            ]
+            alt_patterns = [
+                "basicModel_neutral_lbs_10_207_0_v1.1.0.pkl",
+                "basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl",
+                "SMPL_NEUTRAL.pkl",
+                "SMPL_NEUTRAL.npz",
+            ]
+            src_path = None
+            for d in alt_dirs:
+                for pat in alt_patterns:
+                    candidate = os.path.join(d, pat)
+                    if os.path.exists(candidate):
+                        src_path = candidate
+                        break
+                if src_path:
+                    break
+            if src_path:
+                os.makedirs(os.path.dirname(expected_smpl), exist_ok=True)
+                try:
+                    shutil.copyfile(src_path, expected_smpl)
+                except Exception:
+                    # Best-effort; smplx will raise a clear error if still missing
+                    pass
 
         # Create SMPL-X model
         self.smpl = smplx.create(
