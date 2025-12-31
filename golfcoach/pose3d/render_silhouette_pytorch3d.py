@@ -26,7 +26,7 @@ silhouette : (H, W) torch.Tensor
     Soft silhouette values in [0, 1].
 """
 
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 
 import numpy as np
 import torch
@@ -121,6 +121,8 @@ def render_silhouette(
         image_size=(h, w),
         blur_radius=0.0,
         faces_per_pixel=10,
+        bin_size=0,  # disable binning
+        max_faces_per_bin=100000,  # increase to avoid overflow
     )
 
     blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
