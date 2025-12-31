@@ -147,51 +147,76 @@ def render_silhouette_batched(
     K: Union[np.ndarray, torch.Tensor],
     image_size: Tuple[int, int],
     device: Union[str, torch.device] = "cuda",
-    chunk: int = 8,
 ) -> torch.Tensor:
     """
-    Render silhouettes for a sequence of meshes in chunks to limit memory usage.
+    Render silhouettes for a batch of meshes in a single renderer call.
 
     Args:
-        verts_seq: (T, V, 3) tensor or list of T tensors each (V, 3)
+        verts_seq: (B, V, 3) tensor or list of B tensors each (V, 3)
         faces:     (F, 3) indices
-        K:         (3, 3) or (T, 3, 3) intrinsics
+        K:         (3, 3) or (B, 3, 3) intrinsics
         image_size:(w, h)
         device:    torch device or string
-        chunk:     number of frames per chunk
 
     Returns:
-        (T, H, W) tensor of silhouettes in [0, 1]
+        (B, H, W) tensor of silhouettes in [0, 1]
     """
     dev = torch.device(device)
 
+    # Normalize verts to list of tensors
     if torch.is_tensor(verts_seq):
         if verts_seq.ndim != 3 or verts_seq.shape[2] != 3:
-            raise ValueError(f"verts_seq must be (T, V, 3), got {verts_seq.shape}")
-        T = int(verts_seq.shape[0])
-        get_v = lambda idx: verts_seq[idx]
+            raise ValueError(f"verts_seq must be (B, V, 3), got {verts_seq.shape}")
+        B = int(verts_seq.shape[0])
+        verts_list = [verts_seq[i].to(dev, dtype=torch.float32) for i in range(B)]
     else:
-        T = len(verts_seq)
-        get_v = lambda idx: verts_seq[idx]
+        B = len(verts_seq)
+        verts_list = [v.to(dev, dtype=torch.float32) for v in verts_seq]
 
-    def get_K(idx: int):
-        if torch.is_tensor(K):
-            return K[idx] if K.ndim == 3 else K
-        if isinstance(K, np.ndarray):
-            return K[idx] if K.ndim == 3 else K
-        return K
+    # Normalize faces
+    if torch.is_tensor(faces):
+        faces_t = faces.to(dev, dtype=torch.int64)
+    else:
+        faces_t = torch.as_tensor(faces, dtype=torch.int64, device=dev)
+    faces_list = [faces_t for _ in range(B)]
 
-    outputs: List[torch.Tensor] = []
-    for s in range(0, T, chunk):
-        e = min(T, s + chunk)
-        chunk_outs: List[torch.Tensor] = []
-        for i in range(s, e):
-            v = get_v(i)
-            Ki = get_K(i)
-            sil = render_silhouette(v, faces, Ki, image_size, device=dev)
-            chunk_outs.append(sil)
-        outputs.append(torch.stack(chunk_outs, dim=0))
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    # Build batched cameras from K
+    if not torch.is_tensor(K):
+        K_t = torch.as_tensor(K, dtype=torch.float32, device=dev)
+    else:
+        K_t = K.to(device=dev, dtype=torch.float32)
+    if K_t.ndim == 2:
+        K_t = K_t.unsqueeze(0).expand(B, -1, -1)  # (B,3,3)
+    if K_t.ndim != 3 or K_t.shape[1:] != (3, 3):
+        raise ValueError(f"K must be (3,3) or (B,3,3), got {tuple(K_t.shape)}")
 
-    return torch.cat(outputs, dim=0)
+    fx = K_t[:, 0, 0]
+    fy = K_t[:, 1, 1]
+    cx = K_t[:, 0, 2]
+    cy = K_t[:, 1, 2]
+
+    w, h = int(image_size[0]), int(image_size[1])
+    cameras = PerspectiveCameras(
+        focal_length=torch.stack([fx, fy], dim=-1),
+        principal_point=torch.stack([cx, cy], dim=-1),
+        image_size=torch.tensor([[h, w]], dtype=torch.float32, device=dev).expand(B, -1),
+        in_ndc=False,
+        device=dev,
+    )
+
+    raster_settings = RasterizationSettings(
+        image_size=(h, w),
+        blur_radius=0.0,
+        faces_per_pixel=1,
+        bin_size=0,
+        max_faces_per_bin=100000,
+    )
+    blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
+
+    rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
+    shader = SoftSilhouetteShader(blend_params=blend_params)
+    renderer = MeshRenderer(rasterizer=rasterizer, shader=shader)
+
+    meshes = Meshes(verts=verts_list, faces=faces_list)
+    images = renderer(meshes)  # (B, H, W, 4)
+    return images[..., 3]      # (B, H, W)
