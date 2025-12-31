@@ -107,6 +107,7 @@ def render_silhouette(
         raise ValueError(f"verts_cam must be (V, 3), got {verts_cam.shape}")
 
     dev = torch.device(device)
+    # Force FP32 inputs for PyTorch3D
     verts = verts_cam.to(dev, dtype=torch.float32)
 
     if torch.is_tensor(faces):
@@ -114,7 +115,13 @@ def render_silhouette(
     else:
         faces_t = torch.as_tensor(faces, dtype=torch.int64, device=dev)
 
-    cameras = _build_camera(K, image_size, dev)
+    # K to float32
+    if torch.is_tensor(K):
+        K_use = K.to(device=dev, dtype=torch.float32)
+    else:
+        K_use = torch.as_tensor(K, dtype=torch.float32, device=dev)
+
+    cameras = _build_camera(K_use, image_size, dev)
 
     w, h = int(image_size[0]), int(image_size[1])
     raster_settings = RasterizationSettings(
@@ -134,7 +141,9 @@ def render_silhouette(
 
     meshes = Meshes(verts=[verts], faces=[faces_t])
     # renderer returns (1, H, W, 4); alpha channel is silhouette
-    images = renderer(meshes)
+    # Disable autocast for rasterization/shader for numerical stability
+    with torch.cuda.amp.autocast(enabled=False):
+        images = renderer(meshes)
     alpha = images[0, ..., 3]
     return alpha
 
@@ -168,6 +177,7 @@ def render_silhouette_batched(
         if verts_seq.ndim != 3 or verts_seq.shape[2] != 3:
             raise ValueError(f"verts_seq must be (B, V, 3), got {verts_seq.shape}")
         B = int(verts_seq.shape[0])
+        # Force FP32 per-sample
         verts_list = [verts_seq[i].to(dev, dtype=torch.float32) for i in range(B)]
     else:
         B = len(verts_seq)
@@ -218,5 +228,7 @@ def render_silhouette_batched(
     renderer = MeshRenderer(rasterizer=rasterizer, shader=shader)
 
     meshes = Meshes(verts=verts_list, faces=faces_list)
-    images = renderer(meshes)  # (B, H, W, 4)
+    # Disable autocast for the rasterizer/shader
+    with torch.cuda.amp.autocast(enabled=False):
+        images = renderer(meshes)  # (B, H, W, 4)
     return images[..., 3]      # (B, H, W)
