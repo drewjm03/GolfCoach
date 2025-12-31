@@ -34,6 +34,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
+import time
 
 from pytorch3d.transforms import matrix_to_axis_angle
 
@@ -484,16 +485,79 @@ def fit_smpl_silhouette_stereo(
         }
 
     # ------------------------------------------------------------------
-    # 5) Two-stage optimization (Adam)
+    # 5) Two-stage optimization (Adam) + checkpoint/resume
     # ------------------------------------------------------------------
     loss_history: Dict[str, Any] = {"stage1": [], "stage2": []}
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    ckpt_json_path = out_path / "checkpoint.json"
+    ckpt_stage1_path = out_path / "checkpoint_stage1.npz"
+    ckpt_stage2_path = out_path / "checkpoint_stage2.npz"
+    stage1_done_flag = out_path / "stage1_done.flag"
+    stage2_done_flag = out_path / "stage2_done.flag"
+
+    def _save_checkpoint(stage_name: str, it_idx: int) -> None:
+        data = {
+            "frames": np.asarray(common_frames, dtype=np.int32),
+            "betas": betas_np.astype(np.float32),
+            "glob_aa": glob_aa.detach().cpu().numpy().astype(np.float32),
+            "body_aa": body_aa.detach().cpu().numpy().astype(np.float32),
+            "trans_cam0": trans_cam0.detach().cpu().numpy().astype(np.float32),
+        }
+        if stage_name == "stage1":
+            np.savez_compressed(ckpt_stage1_path, **data)
+        elif stage_name == "stage2":
+            np.savez_compressed(ckpt_stage2_path, **data)
+        manifest = {
+            "stage": stage_name,
+            "it": int(it_idx),
+            "timestamp": time.time(),
+        }
+        with ckpt_json_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[checkpoint] Saved {stage_name} checkpoint at iter {it_idx} to {out_path}")
+
+    def _try_resume() -> tuple[int, int]:
+        start1 = 0
+        start2 = 0
+        if ckpt_json_path.exists():
+            try:
+                with ckpt_json_path.open("r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                stage = manifest.get("stage")
+                it = int(manifest.get("it", 0))
+                if stage == "stage1" and ckpt_stage1_path.exists() and not stage1_done_flag.exists():
+                    arr = np.load(ckpt_stage1_path)
+                    glob_aa.data = torch.as_tensor(arr["glob_aa"], dtype=torch.float32, device=dev)
+                    body_aa.data = torch.as_tensor(arr["body_aa"], dtype=torch.float32, device=dev)
+                    trans_cam0.data = torch.as_tensor(arr["trans_cam0"], dtype=torch.float32, device=dev)
+                    start1 = it + 1
+                    print(f"[resume] Resuming Stage 1 from iter {start1}")
+                elif stage == "stage2" and ckpt_stage2_path.exists() and not stage2_done_flag.exists():
+                    arr = np.load(ckpt_stage2_path)
+                    glob_aa.data = torch.as_tensor(arr["glob_aa"], dtype=torch.float32, device=dev)
+                    body_aa.data = torch.as_tensor(arr["body_aa"], dtype=torch.float32, device=dev)
+                    trans_cam0.data = torch.as_tensor(arr["trans_cam0"], dtype=torch.float32, device=dev)
+                    start2 = it + 1
+                    print(f"[resume] Resuming Stage 2 from iter {start2}")
+            except Exception as exc:
+                print(f"[resume] Failed to load checkpoint manifest: {exc}")
+        return start1, start2
+
+    start_iter_stage1, start_iter_stage2 = _try_resume()
 
     # Stage 1: coarse, optimize only translation + global orientation (chunked backward)
     optimizer1 = torch.optim.Adam([trans_cam0, glob_aa], lr=5e-3)
 
     num_iters_stage1 = 400
-    for it in range(num_iters_stage1):
-        optimizer1.zero_grad(set_to_none=True)
+    if stage1_done_flag.exists():
+        print("[stage1] stage1_done.flag found; skipping Stage 1")
+    else:
+        last_ckpt_time = time.time()
+        for it in range(start_iter_stage1, num_iters_stage1):
+            optimizer1.zero_grad(set_to_none=True)
 
         Tcur = glob_aa.shape[0]
         chunk = 4
@@ -594,25 +658,44 @@ def fit_smpl_silhouette_stereo(
             if do_sil:
                 del sil_left, sil_right
 
-        scaler1.step(optimizer1)
-        scaler1.update()
+            scaler1.step(optimizer1)
+            scaler1.update()
 
-        # Average components over chunks for logging
-        comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
-        loss_history["stage1"].append(comp_avg)
-        if it % 20 == 0 or it == num_iters_stage1 - 1:
-            print(
-                f"[stage1] {it+1}/{num_iters_stage1} "
-                f"size={cur_size} sil={'on' if do_sil else 'off'} "
-                f"Ltot={comp_avg['L_total']:.4f} Lsil={comp_avg['L_sil']:.4f} "
-                f"Ltrans={comp_avg['L_trans']:.4f} Lglob={comp_avg['L_glob']:.4f} "
-                f"Lpose={comp_avg['L_pose_temp']:.4f} Lprior={comp_avg['L_prior']:.6f}"
-            )
+            # Average components over chunks for logging
+            comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
+            loss_history["stage1"].append(comp_avg)
+            if it % 20 == 0 or it == num_iters_stage1 - 1:
+                print(
+                    f"[stage1] {it+1}/{num_iters_stage1} "
+                    f"size={cur_size} sil={'on' if do_sil else 'off'} "
+                    f"Ltot={comp_avg['L_total']:.4f} Lsil={comp_avg['L_sil']:.4f} "
+                    f"Ltrans={comp_avg['L_trans']:.4f} Lglob={comp_avg['L_glob']:.4f} "
+                    f"Lpose={comp_avg['L_pose_temp']:.4f} Lprior={comp_avg['L_prior']:.6f}"
+                )
+
+            # Periodic checkpoint every 5 minutes
+            if time.time() - last_ckpt_time >= 300:
+                _save_checkpoint("stage1", it)
+                last_ckpt_time = time.time()
+
+        # Save stage1 outputs/flag
+        np.savez_compressed(
+            out_path / "stage1_outputs.npz",
+            glob_aa=glob_aa.detach().cpu().numpy().astype(np.float32),
+            trans_cam0=trans_cam0.detach().cpu().numpy().astype(np.float32),
+        )
+        stage1_done_flag.write_text("ok", encoding="utf-8")
+        print("[stage1] Completed; wrote stage1_done.flag")
 
     # Stage 2: full optimization (translation + global + body pose), chunked backward
+    if stage2_done_flag.exists():
+        print("[stage2] stage2_done.flag found; skipping Stage 2 and final save")
+        return
+
     optimizer2 = torch.optim.Adam([trans_cam0, glob_aa, body_aa], lr=2e-3)
     num_iters_stage2 = 1200
-    for it in range(num_iters_stage2):
+    last_ckpt_time = time.time()
+    for it in range(start_iter_stage2, num_iters_stage2):
         optimizer2.zero_grad(set_to_none=True)
 
         Tcur = glob_aa.shape[0]
@@ -725,12 +808,14 @@ def fit_smpl_silhouette_stereo(
                 f"Lpose={comp_avg['L_pose_temp']:.4f} Lprior={comp_avg['L_prior']:.6f}"
             )
 
+        # Periodic checkpoint every 5 minutes
+        if time.time() - last_ckpt_time >= 300:
+            _save_checkpoint("stage2", it)
+            last_ckpt_time = time.time()
+
     # ------------------------------------------------------------------
     # 6) Save outputs
     # ------------------------------------------------------------------
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
     frames_arr = np.asarray(common_frames, dtype=np.int32)
     np.save(out_path / "frames.npy", frames_arr)
     np.save(out_path / "betas.npy", betas_np.astype(np.float32))
@@ -745,6 +830,9 @@ def fit_smpl_silhouette_stereo(
 
     with (out_path / "loss_history.json").open("w", encoding="utf-8") as f:
         json.dump(loss_history, f, indent=2)
+
+    stage2_done_flag.write_text("ok", encoding="utf-8")
+    print("[stage2] Completed; wrote stage2_done.flag")
 
 
 
