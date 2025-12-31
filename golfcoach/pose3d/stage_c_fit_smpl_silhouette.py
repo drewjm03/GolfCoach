@@ -295,6 +295,15 @@ def fit_smpl_silhouette_stereo(
         mL_rle = _get_mask(frame_left, person_i_left)
         mR_rle = _get_mask(frame_right, person_i_right)
 
+        # Debug print to inspect left mask structure before decoding
+        if isinstance(mL_rle, dict):
+            print("mL_rle keys:", list(mL_rle.keys()))
+            for k in ("segmentation", "mask", "rle", "rle_mask"):
+                if k in mL_rle and isinstance(mL_rle[k], dict):
+                    print(k, "keys:", list(mL_rle[k].keys()))
+        else:
+            print("mL_rle type:", type(mL_rle))
+
         mL = decode_phalp_mask(mL_rle)
         mR = decode_phalp_mask(mR_rle)
 
