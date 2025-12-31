@@ -120,7 +120,7 @@ def render_silhouette(
     raster_settings = RasterizationSettings(
         image_size=(h, w),
         blur_radius=0.0,
-        faces_per_pixel=50,
+        faces_per_pixel=10,
     )
 
     blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
@@ -139,3 +139,57 @@ def render_silhouette(
 
 
 
+def render_silhouette_batched(
+    verts_seq: Union[torch.Tensor, List[torch.Tensor]],
+    faces: Union[np.ndarray, torch.Tensor],
+    K: Union[np.ndarray, torch.Tensor],
+    image_size: Tuple[int, int],
+    device: Union[str, torch.device] = "cuda",
+    chunk: int = 8,
+) -> torch.Tensor:
+    """
+    Render silhouettes for a sequence of meshes in chunks to limit memory usage.
+
+    Args:
+        verts_seq: (T, V, 3) tensor or list of T tensors each (V, 3)
+        faces:     (F, 3) indices
+        K:         (3, 3) or (T, 3, 3) intrinsics
+        image_size:(w, h)
+        device:    torch device or string
+        chunk:     number of frames per chunk
+
+    Returns:
+        (T, H, W) tensor of silhouettes in [0, 1]
+    """
+    dev = torch.device(device)
+
+    if torch.is_tensor(verts_seq):
+        if verts_seq.ndim != 3 or verts_seq.shape[2] != 3:
+            raise ValueError(f"verts_seq must be (T, V, 3), got {verts_seq.shape}")
+        T = int(verts_seq.shape[0])
+        get_v = lambda idx: verts_seq[idx]
+    else:
+        T = len(verts_seq)
+        get_v = lambda idx: verts_seq[idx]
+
+    def get_K(idx: int):
+        if torch.is_tensor(K):
+            return K[idx] if K.ndim == 3 else K
+        if isinstance(K, np.ndarray):
+            return K[idx] if K.ndim == 3 else K
+        return K
+
+    outputs: List[torch.Tensor] = []
+    for s in range(0, T, chunk):
+        e = min(T, s + chunk)
+        chunk_outs: List[torch.Tensor] = []
+        for i in range(s, e):
+            v = get_v(i)
+            Ki = get_K(i)
+            sil = render_silhouette(v, faces, Ki, image_size, device=dev)
+            chunk_outs.append(sil)
+        outputs.append(torch.stack(chunk_outs, dim=0))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return torch.cat(outputs, dim=0)

@@ -39,7 +39,7 @@ from apps.smpl_model import SMPLModel
 from golfcoach.io.rig_config import load_rig_config
 from golfcoach.io.phalp_pkl import load_phalp_tracks, extract_smpl
 from golfcoach.io.mask_rle import decode_phalp_mask, undistort_mask
-from golfcoach.pose3d.render_silhouette_pytorch3d import render_silhouette
+from golfcoach.pose3d.render_silhouette_pytorch3d import render_silhouette, render_silhouette_batched
 
 
 def _default_smplx_model_path() -> Path:
@@ -418,22 +418,13 @@ def fit_smpl_silhouette_stereo(
         # Transform to cam1
         verts_cam1 = (verts_cam0 @ R_t.T) + T_t  # broadcast over T,V
 
-        # Render silhouettes per frame
-        sil_left_list: List[torch.Tensor] = []
-        sil_right_list: List[torch.Tensor] = []
-
-        for t_idx in range(Tcur):
-            v0 = verts_cam0[t_idx]
-            v1 = verts_cam1[t_idx]
-
-            sil0 = render_silhouette(v0, faces_t, K0, image_size, device=dev)
-            sil1 = render_silhouette(v1, faces_t, K1, image_size, device=dev)
-
-            sil_left_list.append(sil0)
-            sil_right_list.append(sil1)
-
-        sil_left = torch.stack(sil_left_list, dim=0)  # (T, H, W)
-        sil_right = torch.stack(sil_right_list, dim=0)
+        # Render silhouettes in chunks for memory efficiency
+        sil_left = render_silhouette_batched(
+            verts_seq=verts_cam0, faces=faces_t, K=K0, image_size=image_size, device=dev, chunk=4
+        )  # (T, H, W)
+        sil_right = render_silhouette_batched(
+            verts_seq=verts_cam1, faces=faces_t, K=K1, image_size=image_size, device=dev, chunk=4
+        )
 
         # Silhouette losses
         L_sil_left = _soft_iou_loss(sil_left, target_left)
