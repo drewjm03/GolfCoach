@@ -25,12 +25,16 @@ class SMPLModel(nn.Module):
         self.model_path = str(model_path)
         self.device = torch.device(device)
 
-        # Determine directory containing SMPL files
-        model_dir = (
-            os.path.dirname(self.model_path)
-            if os.path.isfile(self.model_path)
-            else self.model_path
-        )
+        # Determine directory to pass to smplx.create:
+        # smplx expects a ROOT directory that contains a subfolder named after the model_type
+        # e.g., ROOT/smplx/SMPLX_NEUTRAL.npz. If a file path or the 'smplx' folder is provided,
+        # normalize to the ROOT directory.
+        model_dir = self.model_path
+        if os.path.isfile(model_dir):
+            model_dir = os.path.dirname(model_dir)
+        base = os.path.basename(model_dir).lower()
+        if base in {"smplx", "smpl", "smplh", "smpla"}:
+            model_dir = os.path.dirname(model_dir)
 
         # Create SMPL-X model
         self.smpl = smplx.create(
