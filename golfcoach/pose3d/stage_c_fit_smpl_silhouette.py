@@ -53,10 +53,6 @@ def _default_smplx_model_path() -> Path:
     here = Path(__file__).resolve()
     root = here.parents[2]
     candidates = [
-        root / "body_models" / "smpl" / "SMPL_NEUTRAL.pkl",
-        root / "body_models" / "smpl" / "SMPL_NEUTRAL.npz",
-        root / "model_models" / "smpl" / "SMPL_NEUTRAL.pkl",
-        root / "model_models" / "smpl" / "SMPL_NEUTRAL.npz",
         root / "body_models" / "smpl" / "basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl",
     ]
     for p in candidates:
