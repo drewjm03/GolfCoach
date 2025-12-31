@@ -120,7 +120,7 @@ def render_silhouette(
     raster_settings = RasterizationSettings(
         image_size=(h, w),
         blur_radius=0.0,
-        faces_per_pixel=10,
+        faces_per_pixel=1,
         bin_size=0,  # disable binning
         max_faces_per_bin=100000,  # increase to avoid overflow
     )
