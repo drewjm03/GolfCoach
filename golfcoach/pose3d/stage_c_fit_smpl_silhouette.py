@@ -399,7 +399,7 @@ def fit_smpl_silhouette_stereo(
         print("global_orient", global_orient.shape)
         print("body_pose", body_pose_flat.shape)
         print("betas", betas_batch.shape)
-        print("transl", None if transl is None else transl.shape)
+        print("transl", None if trans_cam0 is None else trans_cam0.shape)
         
         out = smpl_layer(
             betas=betas_batch,
