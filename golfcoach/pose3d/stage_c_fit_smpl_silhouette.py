@@ -296,20 +296,7 @@ def fit_smpl_silhouette_stereo(
         mL_rle = _get_mask(frame_left, person_i_left)
         mR_rle = _get_mask(frame_right, person_i_right)
 
-        # Debug print to inspect left mask structure before decoding
-        if isinstance(mL_rle, dict):
-            print("mL_rle keys:", list(mL_rle.keys()))
-            for k in ("segmentation", "mask", "rle", "rle_mask"):
-                if k in mL_rle and isinstance(mL_rle[k], dict):
-                    print(k, "keys:", list(mL_rle[k].keys()))
-        else:
-            print("mL_rle type:", type(mL_rle))
-
-
-        print("mL_rle is list, len =", len(mL_rle))
-        print("first elem type =", type(mL_rle[0]))
-        if isinstance(mL_rle[0], (list, tuple)) and len(mL_rle[0]) > 0:
-            print("first elem[0] type =", type(mL_rle[0][0]))
+        # Decode masks (handles dict or list-of-RLEs)
 
         mL = decode_phalp_mask(mL_rle)
         mR = decode_phalp_mask(mR_rle)
@@ -513,14 +500,14 @@ def fit_smpl_silhouette_stereo(
         num_chunks = (Tcur + chunk - 1) // chunk
 
         comp_sums = {
-            "L_total": 0.0,
-            "L_sil": 0.0,
-            "L_sil_left": 0.0,
-            "L_sil_right": 0.0,
-            "L_trans": 0.0,
-            "L_glob": 0.0,
-            "L_pose_temp": 0.0,
-            "L_prior": 0.0,
+            "L_total": torch.zeros((), device=dev),
+            "L_sil": torch.zeros((), device=dev),
+            "L_sil_left": torch.zeros((), device=dev),
+            "L_sil_right": torch.zeros((), device=dev),
+            "L_trans": torch.zeros((), device=dev),
+            "L_glob": torch.zeros((), device=dev),
+            "L_pose_temp": torch.zeros((), device=dev),
+            "L_prior": torch.zeros((), device=dev),
         }
 
         # Coarse-to-fine size selection
@@ -592,15 +579,15 @@ def fit_smpl_silhouette_stereo(
 
             scaler1.scale(loss_chunk).backward(retain_graph=not is_last)
 
-            comp_sums["L_total"] += float(loss_chunk.detach().cpu())
-            comp_sums["L_sil"] += float(L_sil.detach().cpu())
+            comp_sums["L_total"] = comp_sums["L_total"] + loss_chunk.detach()
+            comp_sums["L_sil"] = comp_sums["L_sil"] + L_sil.detach()
             if do_sil:
-                comp_sums["L_sil_left"] += float(L_sil_left.detach().cpu())
-                comp_sums["L_sil_right"] += float(L_sil_right.detach().cpu())
-            comp_sums["L_trans"] += float(L_trans.detach().cpu())
-            comp_sums["L_glob"] += float(L_glob.detach().cpu())
-            comp_sums["L_pose_temp"] += float(L_pose_temp.detach().cpu())
-            comp_sums["L_prior"] += float(L_prior.detach().cpu())
+                comp_sums["L_sil_left"] = comp_sums["L_sil_left"] + L_sil_left.detach()
+                comp_sums["L_sil_right"] = comp_sums["L_sil_right"] + L_sil_right.detach()
+            comp_sums["L_trans"] = comp_sums["L_trans"] + L_trans.detach()
+            comp_sums["L_glob"] = comp_sums["L_glob"] + L_glob.detach()
+            comp_sums["L_pose_temp"] = comp_sums["L_pose_temp"] + L_pose_temp.detach()
+            comp_sums["L_prior"] = comp_sums["L_prior"] + L_prior.detach()
 
             # free
             del out, verts0, verts1, loss_chunk
@@ -611,7 +598,7 @@ def fit_smpl_silhouette_stereo(
         scaler1.update()
 
         # Average components over chunks for logging
-        comp_avg = {k: v / float(num_chunks) for k, v in comp_sums.items()}
+        comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
         loss_history["stage1"].append(comp_avg)
         if it % 20 == 0 or it == num_iters_stage1 - 1:
             print(
@@ -633,14 +620,14 @@ def fit_smpl_silhouette_stereo(
         num_chunks = (Tcur + chunk - 1) // chunk
 
         comp_sums = {
-            "L_total": 0.0,
-            "L_sil": 0.0,
-            "L_sil_left": 0.0,
-            "L_sil_right": 0.0,
-            "L_trans": 0.0,
-            "L_glob": 0.0,
-            "L_pose_temp": 0.0,
-            "L_prior": 0.0,
+            "L_total": torch.zeros((), device=dev),
+            "L_sil": torch.zeros((), device=dev),
+            "L_sil_left": torch.zeros((), device=dev),
+            "L_sil_right": torch.zeros((), device=dev),
+            "L_trans": torch.zeros((), device=dev),
+            "L_glob": torch.zeros((), device=dev),
+            "L_pose_temp": torch.zeros((), device=dev),
+            "L_prior": torch.zeros((), device=dev),
         }
 
         # Coarse-to-fine size selection
@@ -711,15 +698,15 @@ def fit_smpl_silhouette_stereo(
 
             scaler2.scale(loss_chunk).backward(retain_graph=not is_last)
 
-            comp_sums["L_total"] += float(loss_chunk.detach().cpu())
-            comp_sums["L_sil"] += float(L_sil.detach().cpu())
+            comp_sums["L_total"] = comp_sums["L_total"] + loss_chunk.detach()
+            comp_sums["L_sil"] = comp_sums["L_sil"] + L_sil.detach()
             if do_sil:
-                comp_sums["L_sil_left"] += float(L_sil_left.detach().cpu())
-                comp_sums["L_sil_right"] += float(L_sil_right.detach().cpu())
-            comp_sums["L_trans"] += float(L_trans.detach().cpu())
-            comp_sums["L_glob"] += float(L_glob.detach().cpu())
-            comp_sums["L_pose_temp"] += float(L_pose_temp.detach().cpu())
-            comp_sums["L_prior"] += float(L_prior.detach().cpu())
+                comp_sums["L_sil_left"] = comp_sums["L_sil_left"] + L_sil_left.detach()
+                comp_sums["L_sil_right"] = comp_sums["L_sil_right"] + L_sil_right.detach()
+            comp_sums["L_trans"] = comp_sums["L_trans"] + L_trans.detach()
+            comp_sums["L_glob"] = comp_sums["L_glob"] + L_glob.detach()
+            comp_sums["L_pose_temp"] = comp_sums["L_pose_temp"] + L_pose_temp.detach()
+            comp_sums["L_prior"] = comp_sums["L_prior"] + L_prior.detach()
 
             del out, verts0, verts1, loss_chunk
             if do_sil:
@@ -727,7 +714,7 @@ def fit_smpl_silhouette_stereo(
 
         scaler2.step(optimizer2)
         scaler2.update()
-        comp_avg = {k: v / float(num_chunks) for k, v in comp_sums.items()}
+        comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
         loss_history["stage2"].append(comp_avg)
         if it % 20 == 0 or it == num_iters_stage2 - 1:
             print(
