@@ -39,7 +39,7 @@ class SMPLModel(nn.Module):
         # Create SMPL-X model
         self.smpl = smplx.create(
             model_path=model_dir,
-            model_type="smplx",
+            model_type="smpl",
             gender="neutral",
             use_pca=False,
             batch_size=1,

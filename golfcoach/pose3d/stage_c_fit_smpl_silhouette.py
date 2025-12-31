@@ -44,16 +44,26 @@ from golfcoach.pose3d.render_silhouette_pytorch3d import render_silhouette
 
 def _default_smplx_model_path() -> Path:
     """
-    Heuristic to find the default SMPL-X model shipped with this repo.
+    Heuristic to find the default SMPL model shipped with this repo.
 
     We expect:
-        body_models/smplx/SMPLX_NEUTRAL.npz
+        body_models/smpl/SMPL_NEUTRAL.pkl
     at the project root.
     """
     here = Path(__file__).resolve()
     root = here.parents[2]
-    model_path = root / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
-    return model_path
+    candidates = [
+        root / "body_models" / "smpl" / "SMPL_NEUTRAL.pkl",
+        root / "body_models" / "smpl" / "SMPL_NEUTRAL.npz",
+        root / "model_models" / "smpl" / "SMPL_NEUTRAL.pkl",
+        root / "model_models" / "smpl" / "SMPL_NEUTRAL.npz",
+        root / "body_models" / "smpl" / "basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    # Return the primary expected path so the error message is informative
+    return candidates[0]
 
 
 def _estimate_initial_translation_cam0(
@@ -339,8 +349,8 @@ def fit_smpl_silhouette_stereo(
     smpl_model_path = _default_smplx_model_path()
     if not smpl_model_path.exists():
         raise FileNotFoundError(
-            f"Default SMPL-X model not found at {smpl_model_path}. "
-            "Pass a valid model path or place SMPLX_NEUTRAL.npz there."
+            f"Default SMPL model not found at {smpl_model_path}. "
+            "Place SMPL_NEUTRAL.pkl under body_models/smpl (or model_models/smpl)."
         )
 
     smpl_wrapper = SMPLModel(str(smpl_model_path), device=device)
