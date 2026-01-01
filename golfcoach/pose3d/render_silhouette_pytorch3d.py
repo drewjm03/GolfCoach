@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 from pytorch3d.structures import Meshes
+import torch.amp as amp
 from pytorch3d.renderer import (
     PerspectiveCameras,
     MeshRasterizer,
@@ -142,7 +143,7 @@ def render_silhouette(
     meshes = Meshes(verts=[verts], faces=[faces_t])
     # renderer returns (1, H, W, 4); alpha channel is silhouette
     # Disable autocast for rasterization/shader for numerical stability
-    with torch.cuda.amp.autocast(enabled=False):
+    with amp.autocast("cuda", enabled=False):
         images = renderer(meshes)
     alpha = images[0, ..., 3]
     return alpha
@@ -229,6 +230,6 @@ def render_silhouette_batched(
 
     meshes = Meshes(verts=verts_list, faces=faces_list)
     # Disable autocast for the rasterizer/shader
-    with torch.cuda.amp.autocast(enabled=False):
+    with amp.autocast("cuda", enabled=False):
         images = renderer(meshes)  # (B, H, W, 4)
     return images[..., 3]      # (B, H, W)

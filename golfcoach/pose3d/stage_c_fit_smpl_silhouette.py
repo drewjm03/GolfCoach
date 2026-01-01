@@ -33,7 +33,8 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
+import torch.amp as amp
 import time
 
 from pytorch3d.transforms import matrix_to_axis_angle
@@ -186,7 +187,9 @@ def _silhouette_loss(
     Bootstrappable silhouette loss: BCE + 0.5 * (1 - IoU).
     """
     pred_c = pred.clamp(min=eps, max=1.0 - eps)
-    bce = F.binary_cross_entropy(pred_c, target)
+    # Run BCE in FP32 outside autocast for stability and to avoid AMP restrictions
+    with amp.autocast("cuda", enabled=False):
+        bce = F.binary_cross_entropy(pred_c.float(), target.float())
     iou = _soft_iou_loss(pred, target, eps=eps)
     return bce + 0.5 * iou
 
@@ -630,7 +633,7 @@ def fit_smpl_silhouette_stereo(
             Tchunk = e - s
             is_last = (e == Tcur)
 
-            with autocast(enabled=use_amp, dtype=torch.float16):
+            with amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
                 betas_batch = betas_t.expand(Tchunk, -1)  # (Tc,10)
                 global_orient = glob_aa[s:e]              # (Tc,3)
                 body_pose_flat = body_aa[s:e].view(Tchunk, -1)  # (Tc, 3*J)
@@ -703,9 +706,10 @@ def fit_smpl_silhouette_stereo(
             # Average components over chunks for logging
             comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
             loss_history["stage1"].append(comp_avg)
-            if it % 20 == 0 or it == num_iters_stage1 - 1:
+            display_it = (it - start_iter_stage1) + 1
+            if (display_it % 20) == 0 or it == num_iters_stage1 - 1:
                 print(
-                    f"[stage1] {it+1}/{num_iters_stage1} "
+                    f"[stage1] {display_it}/{num_iters_stage1} "
                     f"size={cur_size} sil={'on' if do_sil else 'off'} "
                     f"Ltot={comp_avg['L_total']:.4f} Lsil={comp_avg['L_sil']:.4f} "
                     f"Ltrans={comp_avg['L_trans']:.4f} Lglob={comp_avg['L_glob']:.4f} "
@@ -785,7 +789,7 @@ def fit_smpl_silhouette_stereo(
             Tchunk = e - s
             is_last = (e == Tcur)
 
-            with autocast(enabled=use_amp, dtype=torch.float16):
+            with amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
                 betas_batch = betas_t.expand(Tchunk, -1)
                 global_orient = glob_aa[s:e]
                 body_pose_flat = body_aa[s:e].view(Tchunk, -1)
@@ -874,9 +878,10 @@ def fit_smpl_silhouette_stereo(
         scaler2.update()
         comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
         loss_history["stage2"].append(comp_avg)
-        if it % 20 == 0 or it == num_iters_stage2 - 1:
+        display_it2 = (it - start_iter_stage2) + 1
+        if (display_it2 % 20) == 0 or it == num_iters_stage2 - 1:
             print(
-                f"[stage2] {it+1}/{num_iters_stage2} "
+                f"[stage2] {display_it2}/{num_iters_stage2} "
                 f"size={cur_size} sil={'on' if do_sil else 'off'} "
                 f"Ltot={comp_avg['L_total']:.4f} Lsil={comp_avg['L_sil']:.4f} "
                 f"Ltrans={comp_avg['L_trans']:.4f} Lglob={comp_avg['L_glob']:.4f} "
