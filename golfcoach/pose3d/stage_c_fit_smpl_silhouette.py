@@ -177,6 +177,36 @@ def _soft_iou_loss(
     return 1.0 - iou.mean()
 
 
+def _silhouette_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Bootstrappable silhouette loss: BCE + 0.5 * (1 - IoU).
+    """
+    pred_c = pred.clamp(min=eps, max=1.0 - eps)
+    bce = F.binary_cross_entropy(pred_c, target)
+    iou = _soft_iou_loss(pred, target, eps=eps)
+    return bce + 0.5 * iou
+
+
+def _save_overlay(pred: torch.Tensor, tgt: torch.Tensor, out_path: Path) -> None:
+    """
+    Save a diagnostic RGB overlay image where R=tgt, G=pred, B=0.
+    pred, tgt: (H, W) in [0, 1]
+    """
+    pred_c = pred.detach().cpu().clamp(0, 1)
+    tgt_c = tgt.detach().cpu().clamp(0, 1)
+    rgb = torch.stack([tgt_c, pred_c, torch.zeros_like(tgt_c)], dim=-1)  # (H,W,3)
+    rgb_u8 = (rgb * 255.0).byte().numpy()
+    try:
+        from PIL import Image
+        Image.fromarray(rgb_u8).save(str(out_path))
+    except Exception as exc:
+        print(f"[debug_sil] Failed to save overlay {out_path}: {exc}")
+
+
 def fit_smpl_silhouette_stereo(
     pkl_left: str,
     pkl_right: str,
@@ -406,7 +436,16 @@ def fit_smpl_silhouette_stereo(
         target_cache[sz] = (_resize_masks(target_left, sz), _resize_masks(target_right, sz))
 
     sil_every_stage1 = 3
-    sil_every_stage2 = 3
+    sil_every_stage2 = 1  # always on by default for Stage 2
+
+    # Warm-start silhouette target dilation (Stage 2)
+    def _dilate_mask(mask: torch.Tensor, k: int) -> torch.Tensor:
+        if k <= 1:
+            return mask
+        pad = k // 2
+        x = mask.unsqueeze(1)
+        x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        return x.squeeze(1)
 
     use_amp = dev.type == "cuda"
     scaler1 = GradScaler(enabled=use_amp)
@@ -693,7 +732,13 @@ def fit_smpl_silhouette_stereo(
         return
 
     optimizer2 = torch.optim.Adam([trans_cam0, glob_aa, body_aa], lr=2e-3)
-    num_iters_stage2 = 1200
+    num_iters_stage2 = 400
+    # Early stopping on L_sil
+    best_sil = float("inf")
+    stall = 0
+    check_every = 25
+    patience = 150
+    min_improve = 1e-3
     last_ckpt_time = time.time()
     for it in range(start_iter_stage2, num_iters_stage2):
         optimizer2.zero_grad(set_to_none=True)
@@ -723,7 +768,17 @@ def fit_smpl_silhouette_stereo(
         K0_scaled = _scale_K(K0, cur_size)
         K1_scaled = _scale_K(K1, cur_size)
         tgtL_full, tgtR_full = target_cache[cur_size]
-        do_sil = (it % sil_every_stage2) == 0
+        do_sil = True  # Stage 2: always render silhouettes
+
+        # Weight schedule (two-phase)
+        if it < int(0.5 * num_iters_stage2):
+            lambda_sil_cur = 10.0
+            lambda_pose_cur = 1.0
+            lambda_prior_cur = 1e-4
+        else:
+            lambda_sil_cur = 5.0
+            lambda_pose_cur = 5.0
+            lambda_prior_cur = 1e-3
 
         for s in range(0, Tcur, chunk):
             e = min(Tcur, s + chunk)
@@ -759,10 +814,18 @@ def fit_smpl_silhouette_stereo(
                     sil_right = render_silhouette_batched(
                         verts_seq=verts1, faces=faces_t, K=K1_scaled, image_size=cur_size, device=dev
                     )
-                    tgt_left = tgtL_full[s:e]
-                    tgt_right = tgtR_full[s:e]
-                    L_sil_left = _soft_iou_loss(sil_left, tgt_left)
-                    L_sil_right = _soft_iou_loss(sil_right, tgt_right)
+                    # Dilated target warm start
+                    if it < 150:
+                        tgt_left = _dilate_mask(tgtL_full[s:e], k=11)
+                        tgt_right = _dilate_mask(tgtR_full[s:e], k=11)
+                    elif it < 300:
+                        tgt_left = _dilate_mask(tgtL_full[s:e], k=7)
+                        tgt_right = _dilate_mask(tgtR_full[s:e], k=7)
+                    else:
+                        tgt_left = tgtL_full[s:e]
+                        tgt_right = tgtR_full[s:e]
+                    L_sil_left = _silhouette_loss(sil_left, tgt_left)
+                    L_sil_right = _silhouette_loss(sil_right, tgt_right)
                     L_sil = L_sil_left + L_sil_right
                 else:
                     L_sil = torch.zeros([], dtype=torch.float32, device=dev)
@@ -773,11 +836,23 @@ def fit_smpl_silhouette_stereo(
                 L_prior = (body_aa[s:e] ** 2).mean()
 
                 loss_chunk = (
-                    lambda_sil * L_sil
+                    lambda_sil_cur * L_sil
                     + lambda_trans * L_trans
-                    + lambda_pose * (L_glob + L_pose_temp)
-                    + lambda_prior * L_prior
+                    + lambda_pose_cur * (L_glob + L_pose_temp)
+                    + lambda_prior_cur * L_prior
                 )
+
+            # Periodic diagnostic overlays (once per iter, on last chunk)
+            if do_sil and is_last and (it % 50 == 0):
+                dbg_dir = out_path / "debug_sil"
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                mid = max(0, (sil_left.shape[0] // 2) - 1)
+                try:
+                    _save_overlay(sil_left[mid], tgt_left[mid], dbg_dir / f"iter_{it:04d}_left.png")
+                    _save_overlay(sil_right[mid], tgt_right[mid], dbg_dir / f"iter_{it:04d}_right.png")
+                    print(f"[debug_sil] Saved overlays at iter {it+1} -> {dbg_dir}")
+                except Exception as exc:
+                    print(f"[debug_sil] Failed to save overlays at iter {it+1}: {exc}")
 
             scaler2.scale(loss_chunk).backward(retain_graph=not is_last)
 
@@ -812,6 +887,18 @@ def fit_smpl_silhouette_stereo(
         if time.time() - last_ckpt_time >= 300:
             _save_checkpoint("stage2", it)
             last_ckpt_time = time.time()
+
+        # Early stopping on silhouette
+        if (it % check_every) == 0:
+            cur_sil = comp_avg["L_sil"]
+            if cur_sil < best_sil - min_improve:
+                best_sil = cur_sil
+                stall = 0
+            else:
+                stall += check_every
+            if stall >= patience:
+                print(f"[stage2] Early stopping at iter {it+1}; best L_sil={best_sil:.4f}")
+                break
 
     # ------------------------------------------------------------------
     # 6) Save outputs
