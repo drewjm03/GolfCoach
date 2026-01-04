@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
 import argparse
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Sequence
 
 import numpy as np
 import cv2
@@ -60,6 +64,13 @@ def _raw_to_used(
 	return u_used
 
 
+def safe_div(num: np.ndarray, den: float, eps: float = 1e-12) -> np.ndarray:
+	den = float(den)
+	if abs(den) < eps:
+		den = eps if den >= 0.0 else -eps
+	return num / den
+
+
 def _align_by_frame_idx(left: Dict, right: Dict) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], List[str], Tuple[int, int]]:
 	# Extract basic arrays
 	tL = np.asarray(left["t"]).astype(np.float64)
@@ -110,6 +121,142 @@ def _align_by_frame_idx(left: Dict, right: Dict) -> Tuple[np.ndarray, Dict[str, 
 	return t.astype(np.float64), dict(kpts=kptsL, conf=confL), dict(kpts=kptsR, conf=confR), jL, szL
 
 
+def debug_single_frame_triangulate_and_reproj(
+	ti: int,
+	kptsL_ud: np.ndarray, kptsR_ud: np.ndarray,       # (T,J,2) undistorted
+	kptsL_raw: np.ndarray | None, kptsR_raw: np.ndarray | None,  # (T,J,2) original (optional)
+	confL: np.ndarray, confR: np.ndarray,             # (T,J)
+	validL_kf: np.ndarray, validR_kf: np.ndarray,     # (T,J)
+	K0: np.ndarray, D0: np.ndarray, K1: np.ndarray, D1: np.ndarray,
+	Rst: np.ndarray, Tst: np.ndarray,
+	joint_names: Sequence[str],
+	image_size: Tuple[int, int],
+	conf_min: float,
+	use_kf_mask: bool,
+	print_all: bool,
+) -> None:
+	T, J, _ = kptsL_ud.shape
+	assert 0 <= ti < T, f"ti out of range: {ti} (T={T})"
+
+	uL = kptsL_ud[ti].astype(np.float64)  # (J,2)
+	uR = kptsR_ud[ti].astype(np.float64)
+	uL_raw = kptsL_raw[ti].astype(np.float64) if kptsL_raw is not None else None
+	uR_raw = kptsR_raw[ti].astype(np.float64) if kptsR_raw is not None else None
+
+	# conf-only masks (recommended)
+	finiteL = np.isfinite(uL).all(axis=1)
+	finiteR = np.isfinite(uR).all(axis=1)
+	mL_conf = (confL[ti] >= conf_min) & finiteL
+	mR_conf = (confR[ti] >= conf_min) & finiteR
+
+	# KF masks
+	mL_kf = validL_kf[ti].astype(bool) & finiteL
+	mR_kf = validR_kf[ti].astype(bool) & finiteR
+
+	mL = mL_kf if use_kf_mask else mL_conf
+	mR = mR_kf if use_kf_mask else mR_conf
+
+	both = mL & mR
+	print("\n================ SINGLE-FRAME TRIANGULATION DEBUG ================")
+	print(f"ti={ti}, use_kf_mask={use_kf_mask}")
+	print(f"conf-only valid L/R: {int(mL_conf.sum())}/{int(mR_conf.sum())}  both={int((mL_conf & mR_conf).sum())}")
+	print(f"KF-gated  valid L/R: {int(mL_kf.sum())}/{int(mR_kf.sum())}  both={int((mL_kf & mR_kf).sum())}")
+	print(f"USING mask L/R:      {int(mL.sum())}/{int(mR.sum())}        both={int(both.sum())}")
+	print("image_size:", image_size)
+	print("K0 fx,cx,fy,cy:", float(K0[0,0]), float(K0[0,2]), float(K0[1,1]), float(K0[1,2]))
+	print("K1 fx,cx,fy,cy:", float(K1[0,0]), float(K1[0,2]), float(K1[1,1]), float(K1[1,2]))
+	print("||Tst||:", float(np.linalg.norm(Tst.reshape(3))))
+
+	# Print per-joint 2D keypoints (raw and undistorted)
+	print("\n-- 2D keypoints (ti=%d) --" % ti)
+	for j in range(J):
+		name = str(joint_names[j])
+		if uL_raw is not None and uR_raw is not None:
+			print(f"{j:02d} {name:>16s}  L_raw={uL_raw[j]}  R_raw={uR_raw[j]}  L_used={uL[j]}  R_used={uR[j]}")
+		else:
+			print(f"{j:02d} {name:>16s}  L_used={uL[j]}  R_used={uR[j]}")
+
+	# Build camera matrices
+	P0 = K0 @ np.hstack([np.eye(3), np.zeros((3, 1))])
+	P1 = K1 @ np.hstack([Rst, Tst.reshape(3, 1)])
+
+	def triangulate_dlt(uL2: np.ndarray, uR2: np.ndarray) -> np.ndarray:
+		xL = np.array([uL2[0], uL2[1], 1.0], dtype=np.float64)
+		xR = np.array([uR2[0], uR2[1], 1.0], dtype=np.float64)
+		A = np.stack([
+			xL[0] * P0[2] - P0[0],
+			xL[1] * P0[2] - P0[1],
+			xR[0] * P1[2] - P1[0],
+			xR[1] * P1[2] - P1[1],
+		], axis=0)
+		_, _, Vt = np.linalg.svd(A)
+		Xh = Vt[-1]
+		w = float(Xh[3])
+		den = w if abs(w) > 1e-12 else (1e-12 if w >= 0 else -1e-12)
+		return (Xh[:3] / den).astype(np.float64)
+
+	def project(P: np.ndarray, X: np.ndarray) -> np.ndarray:
+		Xh = np.append(X, 1.0)
+		x = P @ Xh
+		return safe_div(x[:2], x[2], eps=1e-12).astype(np.float64)
+
+	# Triangulate + reproj errors
+	z_min = 0.2
+	reproj_thresh = 20.0
+	tri_ok = 0
+	reject_z = 0
+	reject_reproj = 0
+
+	errsL: List[float] = []
+	errsR: List[float] = []
+
+	for j in range(J):
+		name = str(joint_names[j])
+		if not both[j]:
+			if print_all:
+				print(f"{j:02d} {name:>16s}  SKIP  confL/R={confL[ti,j]:.3f}/{confR[ti,j]:.3f}  "
+					f"mL={bool(mL[j])} mR={bool(mR[j])}  uL={uL[j]} uR={uR[j]}")
+			continue
+
+		X = triangulate_dlt(uL[j], uR[j])
+		XR = (Rst @ X + Tst.reshape(3))
+		zL = float(X[2]); zR = float(XR[2])
+		if not (np.isfinite(X).all() and np.isfinite(XR).all() and zL > z_min and zR > z_min):
+			reject_z += 1
+			if print_all:
+				print(f"{j:02d} {name:>16s}  REJECT_Z  zL/zR={zL:.3f}/{zR:.3f}  X={X}")
+			continue
+
+		uL_hat = project(P0, X)
+		uR_hat = project(P1, X)
+		eL = float(np.linalg.norm(uL_hat - uL[j]))
+		eR = float(np.linalg.norm(uR_hat - uR[j]))
+
+		if eL > reproj_thresh or eR > reproj_thresh:
+			reject_reproj += 1
+			if print_all:
+				print(f"{j:02d} {name:>16s}  REJECT_REPROJ  eL/eR={eL:.2f}/{eR:.2f}  "
+					f"uL={uL[j]} uLhat={uL_hat}  uR={uR[j]} uRhat={uR_hat}")
+			continue
+
+		tri_ok += 1
+		errsL.append(eL)
+		errsR.append(eR)
+		print(f"{j:02d} {name:>16s}  OK  zL/zR={zL:.3f}/{zR:.3f}  eL/eR={eL:.2f}/{eR:.2f}")
+
+	def stats(a: List[float]) -> str:
+		if len(a) == 0:
+			return "none"
+		arr = np.array(a, dtype=np.float64)
+		return f"n={len(arr)} mean={arr.mean():.2f} med={np.median(arr):.2f} p95={np.percentile(arr,95):.2f}"
+
+	print("---- summary ----")
+	print(f"both2d={int(both.sum())} tri_ok={tri_ok} reject_z={reject_z} reject_reproj={reject_reproj}")
+	print("reproj L:", stats(errsL))
+	print("reproj R:", stats(errsR))
+	print("===============================================================\n")
+
+
 def main() -> None:
 	ap = argparse.ArgumentParser()
 	ap.add_argument("--left_npz", type=str, required=True)
@@ -117,11 +264,16 @@ def main() -> None:
 	ap.add_argument("--rig_json", type=str, required=True)
 	ap.add_argument("--out_npz", type=str, default="")
 	ap.add_argument("--conf_min", type=float, default=0.05)
-	ap.add_argument("--sigma_min_px", type=float, default=2.0)
-	ap.add_argument("--sigma_max_px", type=float, default=40.0)
-	ap.add_argument("--q_accel", type=float, default=50.0)
+	ap.add_argument("--sigma_min_px", type=float, default=10.0)
+	ap.add_argument("--sigma_max_px", type=float, default=80.0)
+	ap.add_argument("--q_accel", type=float, default=1e6)
 	ap.add_argument("--win", type=int, default=30, help="Sliding window size (frames)")
 	ap.add_argument("--stride", type=int, default=10, help="Sliding window stride (frames)")
+	ap.add_argument("--lambda_bone", type=float, default=300.0, help="Weight for bone-length prior")
+	ap.add_argument("--lambda_acc", type=float, default=1e-2, help="Weight for constant-acceleration prior")
+	ap.add_argument("--debug_frame", type=int, default=-1, help="Aligned time index ti to debug (e.g. 79). -1 disables.")
+	ap.add_argument("--debug_use_kf_mask", action="store_true", help="Use KF 'valid' masks instead of conf-only for debug frame.")
+	ap.add_argument("--debug_print_all_joints", action="store_true", help="Print per-joint lines even if invalid.")
 	args = ap.parse_args()
 
 	left = load_npz(args.left_npz)
@@ -218,12 +370,17 @@ def main() -> None:
 			], axis=0)
 			_, _, Vt = np.linalg.svd(A)
 			Xh = Vt[-1]
-			X = (Xh[:3] / max(1e-12, Xh[3])).astype(np.float64)
+			# Enforce positive w
+			if float(Xh[3]) < 0.0:
+				Xh = -Xh
+			w = float(Xh[3])
+			den = w if abs(w) > 1e-12 else (1e-12 if w >= 0 else -1e-12)
+			X = (Xh[:3] / den).astype(np.float64)
 			return X
 		def project(P: np.ndarray, X: np.ndarray) -> np.ndarray:
 			Xh = np.append(X, 1.0)
 			x = P @ Xh
-			return (x[:2] / max(1e-12, x[2])).astype(np.float64)
+			return safe_div(x[:2], x[2], eps=1e-12).astype(np.float64)
 		def reproj_err(u: np.ndarray, uhat: np.ndarray) -> float:
 			return float(np.linalg.norm(u - uhat))
 		uL_px = kptsL_ud[t_best, j_try].astype(np.float64)
@@ -258,6 +415,7 @@ def main() -> None:
 		sigma_min_px=args.sigma_min_px,
 		sigma_max_px=args.sigma_max_px,
 		q_accel=args.q_accel,
+		gate_thresh=100.0,
 	)
 	kfR = kalman_filter_gating_2d(
 		t=t,
@@ -267,11 +425,50 @@ def main() -> None:
 		sigma_min_px=args.sigma_min_px,
 		sigma_max_px=args.sigma_max_px,
 		q_accel=args.q_accel,
+		gate_thresh=100.0,
 	)
 	kL_f = kfL["kpts_filt"]
 	kR_f = kfR["kpts_filt"]
 	validL = kfL["valid"]
 	validR = kfR["valid"]
+
+	# KF diagnostics at ti=79 (if in range)
+	try:
+		ti_dbg = 79
+		if 0 <= ti_dbg < len(t):
+			dt_dbg = float(t[ti_dbg] - t[ti_dbg - 1]) if ti_dbg > 0 else float("nan")
+			print("KF dbg ti:", ti_dbg)
+			print("dt:", dt_dbg)
+			print("KF valid count L/R:", int(validL[ti_dbg].sum()), int(validR[ti_dbg].sum()))
+			print("KF rejected count L/R:", int(kfL["was_rejected"][ti_dbg].sum()), int(kfR["was_rejected"][ti_dbg].sum()))
+			d2L = np.asarray(kfL["d2"][ti_dbg], dtype=np.float64)
+			d2R = np.asarray(kfR["d2"][ti_dbg], dtype=np.float64)
+			print("d2 stats L:", float(np.nanmin(d2L)), float(np.nanmedian(d2L)), float(np.nanmax(d2L)))
+			print("d2 stats R:", float(np.nanmin(d2R)), float(np.nanmedian(d2R)), float(np.nanmax(d2R)))
+	except Exception as _e:
+		print("[WARN] KF debug dump failed:", _e)
+
+	# Single frame debug (conf-only vs KF masks), then exit
+	if args.debug_frame >= 0:
+		debug_single_frame_triangulate_and_reproj(
+			ti=int(args.debug_frame),
+			kptsL_ud=kptsL_ud,
+			kptsR_ud=kptsR_ud,
+			kptsL_raw=L["kpts"],
+			kptsR_raw=R["kpts"],
+			confL=L["conf"],
+			confR=R["conf"],
+			validL_kf=validL,
+			validR_kf=validR,
+			K0=K0, D0=D0, K1=K1, D1=D1,
+			Rst=Rst, Tst=Tst,
+			joint_names=joint_names,
+			image_size=image_size,
+			conf_min=float(args.conf_min),
+			use_kf_mask=bool(args.debug_use_kf_mask),
+			print_all=bool(args.debug_print_all_joints),
+		)
+		return
 
 	# Triangulation init
 	# Force bulk debug for specific frame/joint if desired
@@ -431,7 +628,14 @@ def main() -> None:
 			joint_names=joint_names,
 			X_init=X_init[s:end],
 			valid3d_init=valid3d_init[s:end],
-			cfg=OptimizeConfig(log_every=50, print_progress=True),
+			cfg=OptimizeConfig(
+				log_every=50,
+				print_progress=True,
+				lambda_bone=float(args.lambda_bone),
+				lambda_acc=float(args.lambda_acc),
+				# Keep velocity weak to emphasize constant acceleration primarily
+				lambda_vel=1e-6,
+			),
 			progress_prefix=progress_tag,
 		)
 		# Accumulate
@@ -454,6 +658,23 @@ def main() -> None:
 		X_opt = np.where(N_accum > 0, (X_accum / np.maximum(N_accum, 1e-8)), X_init.astype(np.float64)).astype(np.float32)
 	scale = float(scale_weighted_sum / max(1.0, scale_weight))
 	losses = last_losses
+
+	# Reproject optimized and init 3D (undistorted pixel space, P=K)
+	def _project_np(X: np.ndarray, K: np.ndarray) -> np.ndarray:
+		x = X @ K.T  # (...,3)
+		den = x[..., 2]
+		den = np.where(np.abs(den) > 1e-12, den, np.where(den >= 0.0, 1e-12, -1e-12))
+		return (x[..., :2] / den[..., None]).astype(np.float32)
+
+	X_opt_L = X_opt.astype(np.float64)
+	X_opt_R = (X_opt_L @ Rst.T) + Tst.reshape(1, 1, 3)
+	reproj_opt_left = _project_np(X_opt_L, K0.astype(np.float64))
+	reproj_opt_right = _project_np(X_opt_R, K1.astype(np.float64))
+
+	X_init_L = X_init.astype(np.float64)
+	X_init_R = (X_init_L @ Rst.T) + Tst.reshape(1, 1, 3)
+	reproj_init_left = _project_np(X_init_L, K0.astype(np.float64))
+	reproj_init_right = _project_np(X_init_R, K1.astype(np.float64))
 
 	# RMSE before/after
 	rmse_init_L, rmse_init_R, overall_init_L, overall_init_R = rmse_reprojection_per_joint(
@@ -510,6 +731,11 @@ def main() -> None:
 		rmse_overall_init_right=np.array([overall_init_R], dtype=object),
 		rmse_overall_opt_left=np.array([overall_opt_L], dtype=object),
 		rmse_overall_opt_right=np.array([overall_opt_R], dtype=object),
+		# Reprojections
+		reproj_opt_left=reproj_opt_left,
+		reproj_opt_right=reproj_opt_right,
+		reproj_init_left=reproj_init_left,
+		reproj_init_right=reproj_init_right,
 		# Provide explicit loss names users asked for
 		losses=np.array([
 			{

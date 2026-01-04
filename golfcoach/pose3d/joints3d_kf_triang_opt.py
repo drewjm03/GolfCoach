@@ -15,6 +15,13 @@ from torch.optim import Adam
 # 2D undistortion
 # ------------------------------
 
+def safe_div(num: np.ndarray, den: float, eps: float = 1e-12) -> np.ndarray:
+	den = float(den)
+	if abs(den) < eps:
+		den = eps if den >= 0.0 else -eps
+	return num / den
+
+
 def undistort_kpts_pixels(kpts_px: np.ndarray, K: np.ndarray, D: np.ndarray) -> np.ndarray:
 	"""
 	kpts_px: (T,J,2) distorted pixel coords
@@ -234,7 +241,12 @@ def triangulate_init(
 		)
 		_, _, Vt = np.linalg.svd(A)
 		Xh = Vt[-1]
-		X = (Xh[:3] / max(1e-12, Xh[3])).astype(np.float64)
+		# Enforce positive homogeneous scale
+		if float(Xh[3]) < 0.0:
+			Xh = -Xh
+		w = float(Xh[3])
+		den = w if abs(w) > 1e-12 else 1e-12
+		X = (Xh[:3] / den).astype(np.float64)
 		return X
 
 	for ti in range(T):
@@ -276,8 +288,8 @@ def triangulate_init(
 			# Reprojection check
 			xL = (K_L @ X_L)
 			xR = (K_R @ X_R)
-			uL_hat = xL[:2] / max(1e-8, xL[2])
-			uR_hat = xR[:2] / max(1e-8, xR[2])
+			uL_hat = safe_div(xL[:2], xL[2], eps=1e-8)
+			uR_hat = safe_div(xR[:2], xR[2], eps=1e-8)
 			errL = float(np.linalg.norm(uL_hat - uL))
 			errR = float(np.linalg.norm(uR_hat - uR))
 			reject_reproj = (errL > reproj_thresh_px) or (errR > reproj_thresh_px)
@@ -502,7 +514,7 @@ def _seed_missing_with_depth_prior(
 				if np.isfinite(XL).all() and XL[2] > depth_min_m:
 					# Source-aware reprojection gating (left view only)
 					xL = K_L @ XL
-					uL_hat = xL[:2] / max(1e-12, xL[2])
+					uL_hat = safe_div(xL[:2], xL[2], eps=1e-12)
 					eL = float(np.linalg.norm(uL_hat - uv1[:2]))
 					if eL <= 20.0:
 						out[ti, j, :] = XL.astype(np.float32)
@@ -521,7 +533,7 @@ def _seed_missing_with_depth_prior(
 					if XR[2] > depth_min_m:
 						# Right-view reprojection gating only
 						xR = K_R @ XR
-						uR_hat = xR[:2] / max(1e-12, xR[2])
+						uR_hat = safe_div(xR[:2], xR[2], eps=1e-12)
 						eR = float(np.linalg.norm(uR_hat - uv1[:2]))
 						if eR <= 20.0:
 							out[ti, j, :] = XL.astype(np.float32)
