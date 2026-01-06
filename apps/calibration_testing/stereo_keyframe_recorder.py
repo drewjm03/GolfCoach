@@ -54,6 +54,14 @@ def main():
     parser.add_argument("--corner-order", type=str, default=None,
                         help="Manual corner order override as four comma-separated indices, e.g. '0,1,2,3'. "
                              "If provided, auto corner reordering is disabled.")
+    parser.add_argument(
+        "--no-overlap",
+        action="store_true",
+        help=(
+            "Accept/save keyframes when each camera independently has good detections "
+            "(min tags per view), without requiring any common tag IDs between cameras."
+        ),
+    )
 
     args, _ = parser.parse_known_args()
 
@@ -118,6 +126,7 @@ def main():
         "corner_order": args.corner_order or "",
         "target_keyframes": int(args.target_keyframes),
         "accept_period": float(args.accept_period),
+        "no_overlap": bool(getattr(args, "no_overlap", False)),
     }
     with open(os.path.join(record_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -155,7 +164,7 @@ def main():
             n0 = 0 if ids0 is None else len(ids0)
             n1 = 0 if ids1 is None else len(ids1)
 
-            # Build common ID set for info
+            # Build common ID set for info / JSON
             common_ids = []
             if ids0 is not None and ids1 is not None:
                 set0 = {int(iv[0]) for iv in ids0}
@@ -165,7 +174,7 @@ def main():
             now = time.perf_counter()
             added = False
             if (now - last_accept) >= float(args.accept_period):
-                # Apply same gating logic as accumulate_pair: require enough tags on each cam
+                # Require enough tags on each cam; overlap requirement is controlled by --no-overlap
                 ok0 = (corners0 is not None and ids0 is not None and len(corners0) >= config.MIN_MARKERS_PER_VIEW)
                 ok1 = (corners1 is not None and ids1 is not None and len(corners1) >= config.MIN_MARKERS_PER_VIEW)
                 if ok0 and ok1:
@@ -173,30 +182,38 @@ def main():
                     acc._accumulate_single(0, corners0, ids0)
                     acc._accumulate_single(1, corners1, ids1)
 
-                    # Require at least MIN_MARKERS_PER_VIEW common tags for stereo sample
-                    from apps.calib import StereoSample  # safe import; small helper
-                    # Build maps and sample (same as _match_stereo)
-                    map0 = {int(i[0]): c.reshape(-1, 2) for c, i in zip(corners0, ids0)}
-                    map1 = {int(i[0]): c.reshape(-1, 2) for c, i in zip(corners1, ids1)}
-                    common = sorted(set(map0.keys()) & set(map1.keys()))
-                    obj_pts = []
-                    img0 = []
-                    img1 = []
-                    for tag_id in common:
-                        if tag_id not in acc.id_to_obj:
-                            continue
-                        obj = acc.id_to_obj[tag_id]
-                        obj_pts.append(obj)
-                        img0.append(map0[tag_id])
-                        img1.append(map1[tag_id])
-                    if obj_pts:
-                        obj_pts = np.concatenate(obj_pts, axis=0).astype(np.float32)
-                        img0 = np.concatenate(img0, axis=0).astype(np.float32)
-                        img1 = np.concatenate(img1, axis=0).astype(np.float32)
-                        sample = StereoSample(obj_pts, img0, img1)
-                        if sample.obj_pts.shape[0] >= config.MIN_MARKERS_PER_VIEW * 4:
-                            acc.stereo_samples.append(sample)
-                            added = True
+                    if getattr(args, "no_overlap", False):
+                        # In no-overlap mode, accept this keyframe as long as each
+                        # camera independently has enough tags; do not require any
+                        # common tag IDs at this stage.
+                        added = True
+                    else:
+                        # Default behavior: require at least MIN_MARKERS_PER_VIEW common
+                        # tags for a stereo sample, using the same sample building logic
+                        # as the original implementation.
+                        from apps.calib import StereoSample  # safe import; small helper
+                        # Build maps and sample (same as _match_stereo)
+                        map0 = {int(i[0]): c.reshape(-1, 2) for c, i in zip(corners0, ids0)}
+                        map1 = {int(i[0]): c.reshape(-1, 2) for c, i in zip(corners1, ids1)}
+                        common = sorted(set(map0.keys()) & set(map1.keys()))
+                        obj_pts = []
+                        img0 = []
+                        img1 = []
+                        for tag_id in common:
+                            if tag_id not in acc.id_to_obj:
+                                continue
+                            obj = acc.id_to_obj[tag_id]
+                            obj_pts.append(obj)
+                            img0.append(map0[tag_id])
+                            img1.append(map1[tag_id])
+                        if obj_pts:
+                            obj_pts = np.concatenate(obj_pts, axis=0).astype(np.float32)
+                            img0 = np.concatenate(img0, axis=0).astype(np.float32)
+                            img1 = np.concatenate(img1, axis=0).astype(np.float32)
+                            sample = StereoSample(obj_pts, img0, img1)
+                            if sample.obj_pts.shape[0] >= config.MIN_MARKERS_PER_VIEW * 4:
+                                acc.stereo_samples.append(sample)
+                                added = True
 
                 if added:
                     last_accept = now
@@ -220,6 +237,12 @@ def main():
                                 "ids1": ids1_list,
                                 "corners0": corners0_list,
                                 "corners1": corners1_list,
+                                # Optional diagnostics / bookkeeping
+                                "tags0_count": int(n0),
+                                "tags1_count": int(n1),
+                                "common_ids_count": int(len(common_ids)),
+                                "ts0": float(ts0),
+                                "ts1": float(ts1),
                             },
                             f,
                             indent=2,

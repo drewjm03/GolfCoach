@@ -1,4 +1,5 @@
 import time, queue, cv2
+import threading
 from . import config
 
 def set_manual_exposure_uvc(cap, step=None):
@@ -100,12 +101,25 @@ def open_cam(index, w=1280, h=720, fps=config.CAPTURE_FPS, fourcc="MJPG"):
 class CamReader:
     def __init__(self, index):
         self.cap = open_cam(index)
-        self.q = queue.Queue(maxsize=1)
         self.ok = True
         self.fps = 0.0
         self._times = []
-        self._thread = None
-        import threading
+        self.frames_captured = 0
+        # Latest frame slot protected by a lock (no Queue overhead)
+        self._latest = None  # type: ignore[var-annotated]
+        self._lock = threading.Lock()
+        # High-FPS recording state (per-camera)
+        self.recording = False
+        self.record_queue = queue.Queue(maxsize=300)  # ~2.5s at 120fps
+        self.record_writer = None
+        self.record_thread = None
+        self.record_written = 0
+        self.record_dropped = 0
+        self.record_first_ts = None
+        self.record_last_ts = None
+        self.record_path = None
+        self.record_fps = None
+
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -121,12 +135,17 @@ class CamReader:
 
             ts = time.perf_counter()
 
-            try:
-                while self.q.qsize() >= 1:
-                    self.q.get_nowait()
-            except queue.Empty:
-                pass
-            self.q.put((ts, f))
+            # Count captured frames and update latest slot atomically
+            self.frames_captured += 1
+            with self._lock:
+                self._latest = (ts, f)
+                # Enqueue for recording if enabled
+                if self.recording and self.record_writer is not None:
+                    try:
+                        self.record_queue.put_nowait((ts, f))
+                    except queue.Full:
+                        # Drop the newest frame if queue is full
+                        self.record_dropped += 1
 
             self._times.append(ts)
             if len(self._times) > 30:
@@ -136,17 +155,139 @@ class CamReader:
                 if span > 0:
                     self.fps = (len(self._times) - 1) / span
 
-    def latest(self, timeout=2.0):
-        ts, f = self.q.get(timeout=timeout)
-        while True:
+        # Ensure recording thread is joined on exit
+        if self.record_thread is not None:
+            self.recording = False
+            self.record_thread.join()
+        if self.record_writer is not None:
             try:
-                ts, f = self.q.get_nowait()
+                self.record_writer.release()
+            except Exception:
+                pass
+
+    def _record_loop(self):
+        """Background thread that pulls frames from record_queue and writes them."""
+        while self.recording or not self.record_queue.empty():
+            try:
+                ts, frame = self.record_queue.get(timeout=0.1)
             except queue.Empty:
-                break
-        return ts, f
+                continue
+            writer = self.record_writer
+            if writer is None:
+                continue
+            try:
+                writer.write(frame)
+                self.record_written += 1
+                if self.record_first_ts is None:
+                    self.record_first_ts = ts
+                self.record_last_ts = ts
+            except Exception as e:
+                print(f"[CV][REC] write failed: {e}")
+
+    def latest(self, timeout=2.0):
+        """
+        Return the most recent (timestamp, frame) without queue draining.
+
+        Blocks until a frame is available or until timeout seconds have elapsed.
+        Raises queue.Empty on timeout for compatibility with existing callers.
+        """
+        deadline = time.perf_counter() + float(timeout)
+        last = None
+        while True:
+            with self._lock:
+                last = self._latest
+            if last is not None:
+                return last
+            if time.perf_counter() > deadline:
+                raise queue.Empty()
+            time.sleep(0.005)
+
+    def start_recording_mp4(self, path: str, fps: float, fourcc: str = "mp4v") -> bool:
+        """Start recording frames to an MP4 file at the given FPS.
+
+        Recording happens on a background thread and pulls frames from record_queue.
+        """
+        # Stop any existing recording first
+        if self.recording:
+            self.stop_recording()
+
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), float(fps), (w, h))
+        if not writer.isOpened():
+            print(f"[CV][REC] Failed to open VideoWriter for {path}")
+            return False
+
+        self.record_queue = queue.Queue(maxsize=300)
+        self.record_writer = writer
+        self.record_written = 0
+        self.record_dropped = 0
+        self.record_first_ts = None
+        self.record_last_ts = None
+        self.record_path = path
+        self.record_fps = float(fps)
+        self.recording = True
+        self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
+        self.record_thread.start()
+        print(f"[CV][REC] Started recording -> {path} @ {fps} fps")
+        return True
+
+    def stop_recording(self):
+        """Stop recording and finalize the MP4 file, writing stats sidecar JSON."""
+        if not self.recording and self.record_writer is None:
+            return
+        self.recording = False
+        if self.record_thread is not None:
+            self.record_thread.join()
+            self.record_thread = None
+        if self.record_writer is not None:
+            try:
+                self.record_writer.release()
+            except Exception:
+                pass
+            self.record_writer = None
+
+        # Compute stats
+        captured_total = int(self.frames_captured)
+        written = int(self.record_written)
+        dropped = int(self.record_dropped)
+        first_ts = self.record_first_ts
+        last_ts = self.record_last_ts
+        if written >= 2 and first_ts is not None and last_ts is not None and last_ts > first_ts:
+            duration_written = float(last_ts - first_ts)
+            written_fps = float((written - 1) / duration_written)
+        else:
+            duration_written = 0.0
+            written_fps = 0.0
+
+        print(
+            f"[CV][REC] Stats: captured={captured_total}, "
+            f"written={written}, dropped={dropped}, "
+            f"duration_written={duration_written:.3f}s, written_fps={written_fps:.2f}"
+        )
+
+        # Sidecar JSON
+        if self.record_path:
+            sidecar_path = os.path.splitext(self.record_path)[0] + "_stats.json"
+            payload = {
+                "captured": captured_total,
+                "written": written,
+                "dropped": dropped,
+                "duration_written": duration_written,
+                "written_fps": written_fps,
+            }
+            try:
+                import json
+                with open(sidecar_path, "w", encoding="utf-8") as jf:
+                    json.dump(payload, jf, indent=2)
+                print(f"[CV][REC] Wrote {sidecar_path}")
+            except Exception as e:
+                print(f"[CV][REC] Failed to write stats JSON: {e}")
 
     def release(self):
         self.ok = False
+        # Stop any ongoing recording cleanly
+        self.stop_recording()
         time.sleep(0.05)
         self.cap.release()
 
