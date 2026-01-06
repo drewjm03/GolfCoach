@@ -91,12 +91,21 @@ def _build_recorder_cmd(args, base_out_dir: str | None) -> list[str]:
 	# Grid board: optional corner order override
 	if args.board_source == "grid8x5" and args.corner_order:
 		cmd += ["--corner-order", args.corner_order]
+	# Recording mode: allow/disallow overlap requirement
+	if getattr(args, "no_overlap", False):
+		cmd += ["--no-overlap"]
 	return cmd
 
 
 def _build_calibrator_cmd(args, keyframes_dir: str) -> list[str]:
+	# Choose calibrator implementation based on overlap mode
+	calib_module = (
+		"apps.calibration_testing.stereo_cam_calibrator_offline_no_overlap"
+		if getattr(args, "no_overlap", False)
+		else "apps.calibration_testing.stereo_cam_calibrator_offline"
+	)
 	cmd = [
-		sys.executable, "-m", "apps.calibration_testing.stereo_cam_calibrator_offline",
+		sys.executable, "-m", calib_module,
 		"--keyframes-dir", keyframes_dir,
 		"--board-source", str(args.board_source),
 	]
@@ -349,7 +358,11 @@ def _ground_plane_from_live_capture(
 
 
 def _infer_stamp_from_calib_path(calib_json: str) -> str:
-	m = re.search(r"stereo_offline_calibration_(\d{8}_\d{6})\.json$", os.path.basename(calib_json))
+	# Support both standard and no-overlap calibration filenames
+	m = re.search(
+		r"stereo_offline_calibration(?:_no_overlap)?_(\d{8}_\d{6})\.json$",
+		os.path.basename(calib_json),
+	)
 	if m:
 		return m.group(1)
 	return time.strftime("%Y%m%d_%H%M%S")
@@ -428,6 +441,15 @@ def main():
 	parser.add_argument("--out-dir", type=str, default=None, help="Base output directory (default: repo_root/data).")
 	# Calibrator diagnostics
 	parser.add_argument("--save-all-diag", action="store_true", help="Save diagnostic overlays for all kept views.")
+	# Overlap mode
+	parser.add_argument(
+		"--no-overlap",
+		action="store_true",
+		help=(
+			"Use no-overlap stereo calibration: record keyframes when each camera independently "
+			"has good detections, and estimate stereo extrinsics without requiring shared tag IDs."
+		),
+	)
 	# Rig metadata
 	parser.add_argument("--rig-id", type=str, default=None, help="Optional rig identifier for rig-config JSON.")
 
@@ -470,7 +492,16 @@ def main():
 		sys.exit(1)
 
 	# 3) Locate the most recent calibration JSON
-	calib_json = _latest_file_with_glob(os.path.join(_data_dir(), "stereo_offline_calibration_*.json"))
+	if getattr(args, "no_overlap", False):
+		# Prefer no-overlap calibration outputs if present
+		calib_json = _latest_file_with_glob(
+			os.path.join(_data_dir(), "stereo_offline_calibration_no_overlap_*.json")
+		)
+		if not calib_json:
+			# Fallback to legacy naming if needed
+			calib_json = _latest_file_with_glob(os.path.join(_data_dir(), "stereo_offline_calibration_*.json"))
+	else:
+		calib_json = _latest_file_with_glob(os.path.join(_data_dir(), "stereo_offline_calibration_*.json"))
 	if not calib_json:
 		print("[PIPE][ERR] Calibration JSON not found in data/.")
 		sys.exit(2)

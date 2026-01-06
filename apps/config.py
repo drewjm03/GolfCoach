@@ -11,7 +11,7 @@ DEBUG_PROBES = False        # gate expensive probe/smoke helpers
 # Exposure/gain defaults
 USE_SDK_EXPOSURE = False
 # UVC exposure "step" value: more negative = darker, more positive = brighter.
-DEFAULT_EXPOSURE_STEP = -8
+DEFAULT_EXPOSURE_STEP = -7
 MIN_EXPOSURE_STEP = -14
 MAX_EXPOSURE_STEP = 0
 MIN_EXPOSURE_US = 50

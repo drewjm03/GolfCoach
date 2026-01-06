@@ -3,6 +3,8 @@ import sys
 import time
 import argparse
 import queue
+import json
+import threading
 
 import cv2
 import numpy as np
@@ -69,6 +71,10 @@ def main():
     image_size = (W, H)
     print(f"[VIEW] Image size: {W}x{H}")
 
+    # Local per-camera FPS history, measured at this viewer loop
+    from collections import deque
+    t_hist = [deque(maxlen=60) for _ in cams]
+
     # Build board / accumulator so detection uses the same gating + corner-order logic as calibration tools
     board = load_board(
         board_source=args.board_source,
@@ -110,37 +116,63 @@ def main():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     frames_dir = os.path.join(project_root, "data", "frames")
     os.makedirs(frames_dir, exist_ok=True)
+    print("[VIEW] frames_dir:", frames_dir)
     recording = False
-    writers = {}  # cam_idx -> cv2.VideoWriter
 
     win = "Tag Viewer"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
+    # Display throttling: at high FPS, only draw every Nth frame to reduce UI cost.
+    display_stride = 1
+    try:
+        target_fps = float(getattr(config, "CAPTURE_FPS", 30))
+        if target_fps >= 60:
+            display_stride = 2
+    except Exception:
+        display_stride = 1
+    frame_counter = 0
+    # Precompute camera-index -> array-index mapping to avoid repeated index lookups
+    idx_of = {cam_idx: i for i, cam_idx in enumerate(cam_indices)}
+
     try:
         while True:
-            frames = []
-            grays = []
-            for c in cams:
+            # Latest frames per camera index
+            frame_by_cam: dict[int, np.ndarray] = {}
+            for i, (cam_idx, cam) in enumerate(zip(cam_indices, cams)):
                 try:
-                    ts, f = c.latest()
+                    ts, f = cam.latest()
                 except queue.Empty:
                     continue
-                frames.append(f)
-                grays.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+                # Track local dequeue timestamps per camera for measured FPS
+                try:
+                    t_hist[i].append(time.perf_counter())
+                except Exception:
+                    pass
+                frame_by_cam[cam_idx] = f
 
-            if not frames:
+            if not frame_by_cam:
                 time.sleep(0.01)
+                continue
+
+            # Throttle display to every Nth frame to reduce resize/hconcat/imshow overhead
+            frame_counter += 1
+            do_display = (frame_counter % display_stride == 0)
+            if not do_display:
                 continue
 
             annotated = []
             tag_counts = []
             tag_ids_strs = []
 
-            for idx, (frame, gray) in enumerate(zip(frames, grays)):
-                try:
-                    corners, ids = acc.detect(gray)
-                except Exception:
-                    corners, ids = [], None
+            for cam_idx in cam_indices:
+                frame = frame_by_cam.get(cam_idx)
+                if frame is None:
+                    continue
+                # Temporarily disable AprilTag detection; just display raw frames.
+                # When re-enabling detection, compute grayscale on-demand:
+                # gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # corners, ids = acc.detect(gray)
+                corners, ids = [], None
 
                 vis = frame.copy()
                 n_tags = 0 if ids is None else len(ids)
@@ -157,22 +189,28 @@ def main():
                 except Exception:
                     pass
 
-                label = f"cam{cam_indices[idx]} tags={n_tags}"
+                # Show live capture FPS from CamReader plus local measured FPS
+                fps_cam = 0.0
+                try:
+                    cam = cams[idx_of[cam_idx]]
+                    fps_cam = float(getattr(cam, "fps", 0.0))
+                except Exception:
+                    fps_cam = 0.0
+
+                fps_meas = 0.0
+                try:
+                    th = t_hist[idx_of[cam_idx]]
+                    if len(th) >= 2 and (th[-1] - th[0]) > 0:
+                        fps_meas = (len(th) - 1) / (th[-1] - th[0])
+                except Exception:
+                    fps_meas = 0.0
+
+                label = f"cam{cam_idx} {fps_cam:4.1f}/{fps_meas:4.1f} fps tags={n_tags}"
                 cv2.putText(vis, label, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
                 if tag_ids_strs[-1]:
                     cv2.putText(vis, f"ids: {tag_ids_strs[-1]}", (16, 64),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 annotated.append(vis)
-
-            # If recording, write raw frames from each camera
-            if recording:
-                for cam_idx, frame in zip(cam_indices, frames):
-                    writer = writers.get(cam_idx, None)
-                    if writer is not None:
-                        try:
-                            writer.write(frame)
-                        except Exception as e:
-                            print(f"[VIEW][WARN] Failed to write frame for cam{cam_idx}: {e}")
 
             # Compose output canvas (stack horizontally or vertically depending on number of cams)
             if len(annotated) == 1:
@@ -192,51 +230,55 @@ def main():
             k = cv2.waitKey(1) & 0xFF
 
             if k == ord("r"):
-                # Toggle recording of synchronized video streams
+                # Toggle synchronized recording of all cameras using a shared gate Event
                 if not recording:
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     fps = getattr(config, "CAPTURE_FPS", 30)
-                    writers.clear()
-                    for cam_idx, frame in zip(cam_indices, frames):
-                        h, w = frame.shape[:2]
+                    gate = threading.Event()
+                    any_armed = False
+                    for cam_idx, cam in zip(cam_indices, cams):
                         fname = f"record_{timestamp}_cam{cam_idx}.mp4"
                         out_path = os.path.join(frames_dir, fname)
+                        ok = False
                         try:
-                            writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
-                            if not writer.isOpened():
-                                print(f"[VIEW][WARN] Failed to open writer for cam{cam_idx}: {out_path}")
-                                continue
-                            writers[cam_idx] = writer
-                            print(f"[VIEW] Started recording cam{cam_idx} -> {out_path}")
+                            ok = cam.arm_recording_mp4(out_path, fps, gate, fourcc="mp4v")
                         except Exception as e:
-                            print(f"[VIEW][WARN] Failed to create writer for cam{cam_idx}: {e}")
-                    recording = len(writers) > 0
-                    if not recording:
-                        print("[VIEW][WARN] No video writers started; recording disabled.")
+                            print(f"[VIEW][WARN] Failed to arm recording for cam{cam_idx}: {e}")
+                        if ok:
+                            any_armed = True
+                            print(f"[VIEW] Armed recording cam{cam_idx} -> {out_path}")
+                    if any_armed:
+                        t0 = time.perf_counter()
+                        gate.set()
+                        recording = True
+                        print(f"[VIEW] Recording GO at t={t0:.6f}")
+                    else:
+                        print("[VIEW][WARN] No camera recordings armed; recording disabled.")
                 else:
-                    # Stop recording and close writers
-                    for cam_idx, writer in list(writers.items()):
+                    # Stop per-camera recording; CamReader handles stats + JSON
+                    for cam_idx, cam in zip(cam_indices, cams):
                         try:
-                            writer.release()
-                            print(f"[VIEW] Stopped recording cam{cam_idx}")
-                        except Exception:
-                            pass
-                    writers.clear()
+                            ret = cam.stop_recording()
+                            print(f"[VIEW] Stopped recording cam{cam_idx}, stop_recording() returned: {ret}")
+                        except Exception as e:
+                            print(f"[VIEW][ERR] stop_recording failed for cam{cam_idx}: {type(e).__name__}: {e}")
                     recording = False
 
             if k in (27, ord("q")):
                 print("[VIEW] Quit.")
                 break
     finally:
-        # Clean up cameras and any active writers
+        # If we quit while recording, flush recordings + timestamp JSON
+        for cam_idx, cam in zip(cam_indices, cams):
+            try:
+                ret = cam.stop_recording()
+                print(f"[VIEW] Stopped recording cam{cam_idx} (shutdown), stop_recording() returned: {ret}")
+            except Exception as e:
+                print(f"[VIEW][ERR] stop_recording failed for cam{cam_idx} (shutdown): {type(e).__name__}: {e}")
+
+        # Clean up cameras and windows
         for c in cams:
             c.release()
-        for writer in writers.values():
-            try:
-                writer.release()
-            except Exception:
-                pass
         cv2.destroyAllWindows()
         print("[VIEW] Closed.")
 
