@@ -32,6 +32,34 @@ def decode_phalp_mask(m: Dict[str, Any]) -> np.ndarray:
     np.ndarray
         Binary mask of shape (H, W), dtype uint8 in {0, 1}.
     """
+    # PHALP / COCO may provide segmentation as a list of RLE dicts.
+    # Handle both single-dict and list-of-dicts inputs.
+    if isinstance(m, list):
+        if len(m) == 0:
+            raise ValueError("Empty mask list")
+        # Normalize all entries into valid RLE dicts
+        rles = []
+        for d in m:
+            if not isinstance(d, dict):
+                raise TypeError(f"Unsupported mask list element type: {type(d)}")
+            if "size" not in d or "counts" not in d:
+                raise KeyError(f"Bad RLE dict keys={list(d.keys())}")
+            size_d = d["size"]
+            counts_d = d["counts"]
+            if isinstance(counts_d, str):
+                counts_bytes = counts_d.encode("utf-8")
+            else:
+                counts_bytes = counts_d
+            rles.append({"size": list(size_d), "counts": counts_bytes})
+
+        # Merge multiple parts (safe for length 1 as well)
+        merged = mask_utils.merge(rles)
+        arr = mask_utils.decode(merged)
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            arr = arr[..., 0]
+        return (arr > 0).astype(np.uint8)
+
+    # Dict input (single RLE)
     if "size" not in m or "counts" not in m:
         raise KeyError("RLE mask dict must contain 'size' and 'counts' keys")
 

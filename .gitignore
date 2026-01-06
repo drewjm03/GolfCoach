@@ -28,3 +28,5 @@ __pycache__/
 third_party/4d_humans/data/
 
 third_party/4d_humans/outputs/
+
+body_models/

@@ -32,6 +32,10 @@ import cv2
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from torch.cuda.amp import GradScaler
+import torch.amp as amp
+import time
 
 from pytorch3d.transforms import matrix_to_axis_angle
 
@@ -39,7 +43,7 @@ from apps.smpl_model import SMPLModel
 from golfcoach.io.rig_config import load_rig_config
 from golfcoach.io.phalp_pkl import load_phalp_tracks, extract_smpl
 from golfcoach.io.mask_rle import decode_phalp_mask, undistort_mask
-from golfcoach.pose3d.render_silhouette_pytorch3d import render_silhouette
+from golfcoach.pose3d.render_silhouette_pytorch3d import render_silhouette, render_silhouette_batched
 
 
 def _default_smplx_model_path() -> Path:
@@ -52,8 +56,7 @@ def _default_smplx_model_path() -> Path:
     """
     here = Path(__file__).resolve()
     root = here.parents[2]
-    model_path = root / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
-    return model_path
+    return root / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
 
 
 def _estimate_initial_translation_cam0(
@@ -173,6 +176,38 @@ def _soft_iou_loss(
     union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
     iou = intersection / (union + eps)
     return 1.0 - iou.mean()
+
+
+def _silhouette_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Bootstrappable silhouette loss: BCE + 0.5 * (1 - IoU).
+    """
+    pred_c = pred.clamp(min=eps, max=1.0 - eps)
+    # Run BCE in FP32 outside autocast for stability and to avoid AMP restrictions
+    with amp.autocast("cuda", enabled=False):
+        bce = F.binary_cross_entropy(pred_c.float(), target.float())
+    iou = _soft_iou_loss(pred, target, eps=eps)
+    return bce + 0.5 * iou
+
+
+def _save_overlay(pred: torch.Tensor, tgt: torch.Tensor, out_path: Path) -> None:
+    """
+    Save a diagnostic RGB overlay image where R=tgt, G=pred, B=0.
+    pred, tgt: (H, W) in [0, 1]
+    """
+    pred_c = pred.detach().cpu().clamp(0, 1)
+    tgt_c = tgt.detach().cpu().clamp(0, 1)
+    rgb = torch.stack([tgt_c, pred_c, torch.zeros_like(tgt_c)], dim=-1)  # (H,W,3)
+    rgb_u8 = (rgb * 255.0).byte().numpy()
+    try:
+        from PIL import Image
+        Image.fromarray(rgb_u8).save(str(out_path))
+    except Exception as exc:
+        print(f"[debug_sil] Failed to save overlay {out_path}: {exc}")
 
 
 def fit_smpl_silhouette_stereo(
@@ -295,6 +330,8 @@ def fit_smpl_silhouette_stereo(
         mL_rle = _get_mask(frame_left, person_i_left)
         mR_rle = _get_mask(frame_right, person_i_right)
 
+        # Decode masks (handles dict or list-of-RLEs)
+
         mL = decode_phalp_mask(mL_rle)
         mR = decode_phalp_mask(mR_rle)
 
@@ -325,7 +362,7 @@ def fit_smpl_silhouette_stereo(
     if not smpl_model_path.exists():
         raise FileNotFoundError(
             f"Default SMPL-X model not found at {smpl_model_path}. "
-            "Pass a valid model path or place SMPLX_NEUTRAL.npz there."
+            "Place SMPLX_NEUTRAL.npz under body_models/smplx."
         )
 
     smpl_wrapper = SMPLModel(str(smpl_model_path), device=device)
@@ -371,6 +408,52 @@ def fit_smpl_silhouette_stereo(
     R_t = torch.as_tensor(R, dtype=torch.float32, device=dev)  # (3, 3)
     T_t = torch.as_tensor(T, dtype=torch.float32, device=dev).view(1, 1, 3)  # (1,1,3) for broadcast
 
+    # ------------------------------------------------------------------
+    # Rendering schedule, mask cache, AMP
+    # ------------------------------------------------------------------
+    W_orig, H_orig = int(image_size[0]), int(image_size[1])
+
+    def _scale_K(K_in: np.ndarray, new_size: Tuple[int, int]) -> np.ndarray:
+        new_w, new_h = int(new_size[0]), int(new_size[1])
+        sx = float(new_w) / float(W_orig)
+        sy = float(new_h) / float(H_orig)
+        Kc = np.asarray(K_in, dtype=np.float32).copy()
+        Kc[0, 0] *= sx  # fx
+        Kc[1, 1] *= sy  # fy
+        Kc[0, 2] *= sx  # cx
+        Kc[1, 2] *= sy  # cy
+        return Kc
+
+    render_schedule: List[Tuple[int, int]] = [
+        (min(W_orig, 256), min(H_orig, 256)),
+        (min(W_orig, 384), min(H_orig, 384)),
+        (W_orig, H_orig),
+    ]
+
+    def _resize_masks(tensor_hw: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
+        new_w, new_h = int(size[0]), int(size[1])
+        return F.interpolate(tensor_hw[:, None, :, :], size=(new_h, new_w), mode="nearest")[:, 0]
+
+    target_cache: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+    for sz in render_schedule:
+        target_cache[sz] = (_resize_masks(target_left, sz), _resize_masks(target_right, sz))
+
+    sil_every_stage1 = 3
+    sil_every_stage2 = 1  # always on by default for Stage 2
+
+    # Warm-start silhouette target dilation (Stage 2)
+    def _dilate_mask(mask: torch.Tensor, k: int) -> torch.Tensor:
+        if k <= 1:
+            return mask
+        pad = k // 2
+        x = mask.unsqueeze(1)
+        x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        return x.squeeze(1)
+
+    use_amp = dev.type == "cuda"
+    scaler1 = GradScaler(enabled=use_amp)
+    scaler2 = GradScaler(enabled=use_amp)
+
     def forward_and_loss() -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Run SMPL(-X), render silhouettes in both cameras, and compute losses.
@@ -380,12 +463,23 @@ def fit_smpl_silhouette_stereo(
         betas_batch = betas_t.expand(Tcur, -1)  # (T, 10)
         global_orient = glob_aa  # (T, 3)
         body_pose_flat = body_aa.view(Tcur, -1)  # (T, 3 * J_body_model)
-
+        
+        print("global_orient", global_orient.shape)
+        print("body_pose", body_pose_flat.shape)
+        print("betas", betas_batch.shape)
+        print("transl", None if trans_cam0 is None else trans_cam0.shape)
+        
         out = smpl_layer(
             betas=betas_batch,
             global_orient=global_orient,
             body_pose=body_pose_flat,
             transl=trans_cam0,
+            left_hand_pose=torch.zeros((Tcur, 45), dtype=torch.float32, device=dev),
+            right_hand_pose=torch.zeros((Tcur, 45), dtype=torch.float32, device=dev),
+            jaw_pose=torch.zeros((Tcur, 3), dtype=torch.float32, device=dev),
+            leye_pose=torch.zeros((Tcur, 3), dtype=torch.float32, device=dev),
+            reye_pose=torch.zeros((Tcur, 3), dtype=torch.float32, device=dev),
+            expression=torch.zeros((Tcur, 10), dtype=torch.float32, device=dev),
             pose2rot=True,
         )
         verts_cam0 = out.vertices  # (T, V, 3)
@@ -393,22 +487,13 @@ def fit_smpl_silhouette_stereo(
         # Transform to cam1
         verts_cam1 = (verts_cam0 @ R_t.T) + T_t  # broadcast over T,V
 
-        # Render silhouettes per frame
-        sil_left_list: List[torch.Tensor] = []
-        sil_right_list: List[torch.Tensor] = []
-
-        for t_idx in range(Tcur):
-            v0 = verts_cam0[t_idx]
-            v1 = verts_cam1[t_idx]
-
-            sil0 = render_silhouette(v0, faces_t, K0, image_size, device=dev)
-            sil1 = render_silhouette(v1, faces_t, K1, image_size, device=dev)
-
-            sil_left_list.append(sil0)
-            sil_right_list.append(sil1)
-
-        sil_left = torch.stack(sil_left_list, dim=0)  # (T, H, W)
-        sil_right = torch.stack(sil_right_list, dim=0)
+        # Render silhouettes in chunks for memory efficiency
+        sil_left = render_silhouette_batched(
+            verts_seq=verts_cam0, faces=faces_t, K=K0, image_size=image_size, device=dev, chunk=4
+        )  # (T, H, W)
+        sil_right = render_silhouette_batched(
+            verts_seq=verts_cam1, faces=faces_t, K=K1, image_size=image_size, device=dev, chunk=4
+        )
 
         # Silhouette losses
         L_sil_left = _soft_iou_loss(sil_left, target_left)
@@ -442,43 +527,387 @@ def fit_smpl_silhouette_stereo(
         }
 
     # ------------------------------------------------------------------
-    # 5) Two-stage optimization (Adam)
+    # 5) Two-stage optimization (Adam) + checkpoint/resume
     # ------------------------------------------------------------------
     loss_history: Dict[str, Any] = {"stage1": [], "stage2": []}
 
-    # Stage 1: coarse, optimize only translation + global orientation
-    optimizer1 = torch.optim.Adam(
-        [trans_cam0, glob_aa],
-        lr=5e-3,
-    )
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    ckpt_json_path = out_path / "checkpoint.json"
+    ckpt_stage1_path = out_path / "checkpoint_stage1.npz"
+    ckpt_stage2_path = out_path / "checkpoint_stage2.npz"
+    stage1_done_flag = out_path / "stage1_done.flag"
+    stage2_done_flag = out_path / "stage2_done.flag"
+
+    def _save_checkpoint(stage_name: str, it_idx: int) -> None:
+        data = {
+            "frames": np.asarray(common_frames, dtype=np.int32),
+            "betas": betas_np.astype(np.float32),
+            "glob_aa": glob_aa.detach().cpu().numpy().astype(np.float32),
+            "body_aa": body_aa.detach().cpu().numpy().astype(np.float32),
+            "trans_cam0": trans_cam0.detach().cpu().numpy().astype(np.float32),
+        }
+        if stage_name == "stage1":
+            np.savez_compressed(ckpt_stage1_path, **data)
+        elif stage_name == "stage2":
+            np.savez_compressed(ckpt_stage2_path, **data)
+        manifest = {
+            "stage": stage_name,
+            "it": int(it_idx),
+            "timestamp": time.time(),
+        }
+        with ckpt_json_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[checkpoint] Saved {stage_name} checkpoint at iter {it_idx} to {out_path}")
+
+    def _try_resume() -> tuple[int, int]:
+        start1 = 0
+        start2 = 0
+        if ckpt_json_path.exists():
+            try:
+                with ckpt_json_path.open("r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                stage = manifest.get("stage")
+                it = int(manifest.get("it", 0))
+                if stage == "stage1" and ckpt_stage1_path.exists() and not stage1_done_flag.exists():
+                    arr = np.load(ckpt_stage1_path)
+                    glob_aa.data = torch.as_tensor(arr["glob_aa"], dtype=torch.float32, device=dev)
+                    body_aa.data = torch.as_tensor(arr["body_aa"], dtype=torch.float32, device=dev)
+                    trans_cam0.data = torch.as_tensor(arr["trans_cam0"], dtype=torch.float32, device=dev)
+                    start1 = it + 1
+                    print(f"[resume] Resuming Stage 1 from iter {start1}")
+                elif stage == "stage2" and ckpt_stage2_path.exists() and not stage2_done_flag.exists():
+                    arr = np.load(ckpt_stage2_path)
+                    glob_aa.data = torch.as_tensor(arr["glob_aa"], dtype=torch.float32, device=dev)
+                    body_aa.data = torch.as_tensor(arr["body_aa"], dtype=torch.float32, device=dev)
+                    trans_cam0.data = torch.as_tensor(arr["trans_cam0"], dtype=torch.float32, device=dev)
+                    start2 = it + 1
+                    print(f"[resume] Resuming Stage 2 from iter {start2}")
+            except Exception as exc:
+                print(f"[resume] Failed to load checkpoint manifest: {exc}")
+        return start1, start2
+
+    start_iter_stage1, start_iter_stage2 = _try_resume()
+
+    # Stage 1: coarse, optimize only translation + global orientation (chunked backward)
+    optimizer1 = torch.optim.Adam([trans_cam0, glob_aa], lr=5e-3)
 
     num_iters_stage1 = 400
-    for it in range(num_iters_stage1):
-        optimizer1.zero_grad(set_to_none=True)
-        loss, components = forward_and_loss()
-        loss.backward()
-        optimizer1.step()
-        loss_history["stage1"].append(components)
+    if stage1_done_flag.exists():
+        print("[stage1] stage1_done.flag found; skipping Stage 1")
+    else:
+        last_ckpt_time = time.time()
+        for it in range(start_iter_stage1, num_iters_stage1):
+            optimizer1.zero_grad(set_to_none=True)
 
-    # Stage 2: full optimization (translation + global + body pose)
-    optimizer2 = torch.optim.Adam(
-        [trans_cam0, glob_aa, body_aa],
-        lr=2e-3,
-    )
-    num_iters_stage2 = 1200
-    for it in range(num_iters_stage2):
+        Tcur = glob_aa.shape[0]
+        chunk = 4
+        num_chunks = (Tcur + chunk - 1) // chunk
+
+        comp_sums = {
+            "L_total": torch.zeros((), device=dev),
+            "L_sil": torch.zeros((), device=dev),
+            "L_sil_left": torch.zeros((), device=dev),
+            "L_sil_right": torch.zeros((), device=dev),
+            "L_trans": torch.zeros((), device=dev),
+            "L_glob": torch.zeros((), device=dev),
+            "L_pose_temp": torch.zeros((), device=dev),
+            "L_prior": torch.zeros((), device=dev),
+        }
+
+        # Coarse-to-fine size selection
+        if it < int(0.6 * num_iters_stage1):
+            cur_size = render_schedule[0]
+        elif it < int(0.9 * num_iters_stage1):
+            cur_size = render_schedule[1]
+        else:
+            cur_size = render_schedule[2]
+        K0_scaled = _scale_K(K0, cur_size)
+        K1_scaled = _scale_K(K1, cur_size)
+        tgtL_full, tgtR_full = target_cache[cur_size]
+        do_sil = (it % sil_every_stage1) == 0
+
+        for s in range(0, Tcur, chunk):
+            e = min(Tcur, s + chunk)
+            Tchunk = e - s
+            is_last = (e == Tcur)
+
+            with amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+                betas_batch = betas_t.expand(Tchunk, -1)  # (Tc,10)
+                global_orient = glob_aa[s:e]              # (Tc,3)
+                body_pose_flat = body_aa[s:e].view(Tchunk, -1)  # (Tc, 3*J)
+                transl_chunk = trans_cam0[s:e]            # (Tc,3)
+
+                out = smpl_layer(
+                    betas=betas_batch,
+                    global_orient=global_orient,
+                    body_pose=body_pose_flat,
+                    transl=transl_chunk,
+                    left_hand_pose=torch.zeros((Tchunk, 45), dtype=torch.float32, device=dev),
+                    right_hand_pose=torch.zeros((Tchunk, 45), dtype=torch.float32, device=dev),
+                    jaw_pose=torch.zeros((Tchunk, 3), dtype=torch.float32, device=dev),
+                    leye_pose=torch.zeros((Tchunk, 3), dtype=torch.float32, device=dev),
+                    reye_pose=torch.zeros((Tchunk, 3), dtype=torch.float32, device=dev),
+                    expression=torch.zeros((Tchunk, 10), dtype=torch.float32, device=dev),
+                    pose2rot=True,
+                )
+                verts0 = out.vertices  # (Tc,V,3)
+                verts1 = (verts0 @ R_t.T) + T_t  # (Tc,V,3)
+
+                # Priors (always)
+                L_trans = _compute_temporal_second_order(trans_cam0[s:e])
+                L_glob = _compute_temporal_second_order(glob_aa[s:e])
+                L_pose_temp = _compute_temporal_second_order(body_aa[s:e].view(Tchunk, -1))
+                L_prior = (body_aa[s:e] ** 2).mean()
+
+                if do_sil:
+                    sil_left = render_silhouette_batched(
+                        verts_seq=verts0, faces=faces_t, K=K0_scaled, image_size=cur_size, device=dev
+                    )  # (Tc,H,W)
+                    sil_right = render_silhouette_batched(
+                        verts_seq=verts1, faces=faces_t, K=K1_scaled, image_size=cur_size, device=dev
+                    )
+                    tgt_left = tgtL_full[s:e]
+                    tgt_right = tgtR_full[s:e]
+                    L_sil_left = _soft_iou_loss(sil_left, tgt_left)
+                    L_sil_right = _soft_iou_loss(sil_right, tgt_right)
+                    L_sil = L_sil_left + L_sil_right
+                else:
+                    L_sil = torch.zeros([], dtype=torch.float32, device=dev)
+
+                loss_chunk = (
+                    lambda_sil * L_sil
+                    + lambda_trans * L_trans
+                    + lambda_pose * (L_glob + L_pose_temp)
+                    + lambda_prior * L_prior
+                )
+
+            scaler1.scale(loss_chunk).backward(retain_graph=not is_last)
+
+            comp_sums["L_total"] = comp_sums["L_total"] + loss_chunk.detach()
+            comp_sums["L_sil"] = comp_sums["L_sil"] + L_sil.detach()
+            if do_sil:
+                comp_sums["L_sil_left"] = comp_sums["L_sil_left"] + L_sil_left.detach()
+                comp_sums["L_sil_right"] = comp_sums["L_sil_right"] + L_sil_right.detach()
+            comp_sums["L_trans"] = comp_sums["L_trans"] + L_trans.detach()
+            comp_sums["L_glob"] = comp_sums["L_glob"] + L_glob.detach()
+            comp_sums["L_pose_temp"] = comp_sums["L_pose_temp"] + L_pose_temp.detach()
+            comp_sums["L_prior"] = comp_sums["L_prior"] + L_prior.detach()
+
+            # free
+            del out, verts0, verts1, loss_chunk
+            if do_sil:
+                del sil_left, sil_right
+
+            scaler1.step(optimizer1)
+            scaler1.update()
+
+            # Average components over chunks for logging
+            comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
+            loss_history["stage1"].append(comp_avg)
+            display_it = (it - start_iter_stage1) + 1
+            if (display_it % 20) == 0 or it == num_iters_stage1 - 1:
+                print(
+                    f"[stage1] {display_it}/{num_iters_stage1} "
+                    f"size={cur_size} sil={'on' if do_sil else 'off'} "
+                    f"Ltot={comp_avg['L_total']:.4f} Lsil={comp_avg['L_sil']:.4f} "
+                    f"Ltrans={comp_avg['L_trans']:.4f} Lglob={comp_avg['L_glob']:.4f} "
+                    f"Lpose={comp_avg['L_pose_temp']:.4f} Lprior={comp_avg['L_prior']:.6f}"
+                )
+
+            # Periodic checkpoint every 5 minutes
+            if time.time() - last_ckpt_time >= 300:
+                _save_checkpoint("stage1", it)
+                last_ckpt_time = time.time()
+
+        # Save stage1 outputs/flag
+        np.savez_compressed(
+            out_path / "stage1_outputs.npz",
+            glob_aa=glob_aa.detach().cpu().numpy().astype(np.float32),
+            trans_cam0=trans_cam0.detach().cpu().numpy().astype(np.float32),
+        )
+        stage1_done_flag.write_text("ok", encoding="utf-8")
+        print("[stage1] Completed; wrote stage1_done.flag")
+
+    # Stage 2: full optimization (translation + global + body pose), chunked backward
+    if stage2_done_flag.exists():
+        print("[stage2] stage2_done.flag found; skipping Stage 2 and final save")
+        return
+
+    optimizer2 = torch.optim.Adam([trans_cam0, glob_aa, body_aa], lr=2e-3)
+    num_iters_stage2 = 400
+    # Early stopping on L_sil
+    best_sil = float("inf")
+    stall = 0
+    check_every = 25
+    patience = 150
+    min_improve = 1e-3
+    last_ckpt_time = time.time()
+    for it in range(start_iter_stage2, num_iters_stage2):
         optimizer2.zero_grad(set_to_none=True)
-        loss, components = forward_and_loss()
-        loss.backward()
-        optimizer2.step()
-        loss_history["stage2"].append(components)
+
+        Tcur = glob_aa.shape[0]
+        chunk = 4
+        num_chunks = (Tcur + chunk - 1) // chunk
+
+        comp_sums = {
+            "L_total": torch.zeros((), device=dev),
+            "L_sil": torch.zeros((), device=dev),
+            "L_sil_left": torch.zeros((), device=dev),
+            "L_sil_right": torch.zeros((), device=dev),
+            "L_trans": torch.zeros((), device=dev),
+            "L_glob": torch.zeros((), device=dev),
+            "L_pose_temp": torch.zeros((), device=dev),
+            "L_prior": torch.zeros((), device=dev),
+        }
+
+        # Coarse-to-fine size selection
+        if it < int(0.6 * num_iters_stage2):
+            cur_size = render_schedule[0]
+        elif it < int(0.9 * num_iters_stage2):
+            cur_size = render_schedule[1]
+        else:
+            cur_size = render_schedule[2]
+        K0_scaled = _scale_K(K0, cur_size)
+        K1_scaled = _scale_K(K1, cur_size)
+        tgtL_full, tgtR_full = target_cache[cur_size]
+        do_sil = True  # Stage 2: always render silhouettes
+
+        # Weight schedule (two-phase)
+        if it < int(0.5 * num_iters_stage2):
+            lambda_sil_cur = 10.0
+            lambda_pose_cur = 1.0
+            lambda_prior_cur = 1e-4
+        else:
+            lambda_sil_cur = 5.0
+            lambda_pose_cur = 5.0
+            lambda_prior_cur = 1e-3
+
+        for s in range(0, Tcur, chunk):
+            e = min(Tcur, s + chunk)
+            Tchunk = e - s
+            is_last = (e == Tcur)
+
+            with amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+                betas_batch = betas_t.expand(Tchunk, -1)
+                global_orient = glob_aa[s:e]
+                body_pose_flat = body_aa[s:e].view(Tchunk, -1)
+                transl_chunk = trans_cam0[s:e]
+
+                out = smpl_layer(
+                    betas=betas_batch,
+                    global_orient=global_orient,
+                    body_pose=body_pose_flat,
+                    transl=transl_chunk,
+                    left_hand_pose=torch.zeros((Tchunk, 45), dtype=torch.float32, device=dev),
+                    right_hand_pose=torch.zeros((Tchunk, 45), dtype=torch.float32, device=dev),
+                    jaw_pose=torch.zeros((Tchunk, 3), dtype=torch.float32, device=dev),
+                    leye_pose=torch.zeros((Tchunk, 3), dtype=torch.float32, device=dev),
+                    reye_pose=torch.zeros((Tchunk, 3), dtype=torch.float32, device=dev),
+                    expression=torch.zeros((Tchunk, 10), dtype=torch.float32, device=dev),
+                    pose2rot=True,
+                )
+                verts0 = out.vertices
+                verts1 = (verts0 @ R_t.T) + T_t
+
+                if do_sil:
+                    sil_left = render_silhouette_batched(
+                        verts_seq=verts0, faces=faces_t, K=K0_scaled, image_size=cur_size, device=dev
+                    )
+                    sil_right = render_silhouette_batched(
+                        verts_seq=verts1, faces=faces_t, K=K1_scaled, image_size=cur_size, device=dev
+                    )
+                    # Dilated target warm start
+                    if it < 150:
+                        tgt_left = _dilate_mask(tgtL_full[s:e], k=11)
+                        tgt_right = _dilate_mask(tgtR_full[s:e], k=11)
+                    elif it < 300:
+                        tgt_left = _dilate_mask(tgtL_full[s:e], k=7)
+                        tgt_right = _dilate_mask(tgtR_full[s:e], k=7)
+                    else:
+                        tgt_left = tgtL_full[s:e]
+                        tgt_right = tgtR_full[s:e]
+                    L_sil_left = _silhouette_loss(sil_left, tgt_left)
+                    L_sil_right = _silhouette_loss(sil_right, tgt_right)
+                    L_sil = L_sil_left + L_sil_right
+                else:
+                    L_sil = torch.zeros([], dtype=torch.float32, device=dev)
+
+                L_trans = _compute_temporal_second_order(trans_cam0[s:e])
+                L_glob = _compute_temporal_second_order(glob_aa[s:e])
+                L_pose_temp = _compute_temporal_second_order(body_aa[s:e].view(Tchunk, -1))
+                L_prior = (body_aa[s:e] ** 2).mean()
+
+                loss_chunk = (
+                    lambda_sil_cur * L_sil
+                    + lambda_trans * L_trans
+                    + lambda_pose_cur * (L_glob + L_pose_temp)
+                    + lambda_prior_cur * L_prior
+                )
+
+            # Periodic diagnostic overlays (once per iter, on last chunk)
+            if do_sil and is_last and (it % 50 == 0):
+                dbg_dir = out_path / "debug_sil"
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                mid = max(0, (sil_left.shape[0] // 2) - 1)
+                try:
+                    _save_overlay(sil_left[mid], tgt_left[mid], dbg_dir / f"iter_{it:04d}_left.png")
+                    _save_overlay(sil_right[mid], tgt_right[mid], dbg_dir / f"iter_{it:04d}_right.png")
+                    print(f"[debug_sil] Saved overlays at iter {it+1} -> {dbg_dir}")
+                except Exception as exc:
+                    print(f"[debug_sil] Failed to save overlays at iter {it+1}: {exc}")
+
+            scaler2.scale(loss_chunk).backward(retain_graph=not is_last)
+
+            comp_sums["L_total"] = comp_sums["L_total"] + loss_chunk.detach()
+            comp_sums["L_sil"] = comp_sums["L_sil"] + L_sil.detach()
+            if do_sil:
+                comp_sums["L_sil_left"] = comp_sums["L_sil_left"] + L_sil_left.detach()
+                comp_sums["L_sil_right"] = comp_sums["L_sil_right"] + L_sil_right.detach()
+            comp_sums["L_trans"] = comp_sums["L_trans"] + L_trans.detach()
+            comp_sums["L_glob"] = comp_sums["L_glob"] + L_glob.detach()
+            comp_sums["L_pose_temp"] = comp_sums["L_pose_temp"] + L_pose_temp.detach()
+            comp_sums["L_prior"] = comp_sums["L_prior"] + L_prior.detach()
+
+            del out, verts0, verts1, loss_chunk
+            if do_sil:
+                del sil_left, sil_right
+
+        scaler2.step(optimizer2)
+        scaler2.update()
+        comp_avg = {k: float((v / num_chunks).item()) for k, v in comp_sums.items()}
+        loss_history["stage2"].append(comp_avg)
+        display_it2 = (it - start_iter_stage2) + 1
+        if (display_it2 % 20) == 0 or it == num_iters_stage2 - 1:
+            print(
+                f"[stage2] {display_it2}/{num_iters_stage2} "
+                f"size={cur_size} sil={'on' if do_sil else 'off'} "
+                f"Ltot={comp_avg['L_total']:.4f} Lsil={comp_avg['L_sil']:.4f} "
+                f"Ltrans={comp_avg['L_trans']:.4f} Lglob={comp_avg['L_glob']:.4f} "
+                f"Lpose={comp_avg['L_pose_temp']:.4f} Lprior={comp_avg['L_prior']:.6f}"
+            )
+
+        # Periodic checkpoint every 5 minutes
+        if time.time() - last_ckpt_time >= 300:
+            _save_checkpoint("stage2", it)
+            last_ckpt_time = time.time()
+
+        # Early stopping on silhouette
+        if (it % check_every) == 0:
+            cur_sil = comp_avg["L_sil"]
+            if cur_sil < best_sil - min_improve:
+                best_sil = cur_sil
+                stall = 0
+            else:
+                stall += check_every
+            if stall >= patience:
+                print(f"[stage2] Early stopping at iter {it+1}; best L_sil={best_sil:.4f}")
+                break
 
     # ------------------------------------------------------------------
     # 6) Save outputs
     # ------------------------------------------------------------------
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
     frames_arr = np.asarray(common_frames, dtype=np.int32)
     np.save(out_path / "frames.npy", frames_arr)
     np.save(out_path / "betas.npy", betas_np.astype(np.float32))
@@ -493,6 +922,9 @@ def fit_smpl_silhouette_stereo(
 
     with (out_path / "loss_history.json").open("w", encoding="utf-8") as f:
         json.dump(loss_history, f, indent=2)
+
+    stage2_done_flag.write_text("ok", encoding="utf-8")
+    print("[stage2] Completed; wrote stage2_done.flag")
 
 
 
