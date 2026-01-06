@@ -91,18 +91,10 @@ class GolfPose2DProvider:
         det = inference_detector(self.det_model, frame_bgr)
         inst = det.pred_instances
 
-        # Debug info about detector outputs
+        # Detector outputs
         boxes = inst.bboxes.detach().cpu().numpy()
         scores = inst.scores.detach().cpu().numpy()
         labels = inst.labels.detach().cpu().numpy()
-        print(
-            "DET:",
-            boxes.shape,
-            "score max:",
-            float(scores.max()) if scores.size else None,
-            "unique labels:",
-            np.unique(labels) if labels.size else None,
-        )
 
         # If detector produced no boxes at all, try to keep the previous ROI.
         if boxes.shape[0] == 0:

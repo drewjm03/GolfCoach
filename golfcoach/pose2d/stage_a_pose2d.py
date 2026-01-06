@@ -45,6 +45,14 @@ def run_pose2d_on_video(
         kpts_list.append(kpts)
         conf_list.append(conf)
         bbox_list.append(bbox)
+        # Lightweight progress print every 20 processed frames.
+        if len(idx_list) % 20 == 0:
+            total = info.frame_count if info.frame_count > 0 else "?"
+            print(
+                f"[StageA] {Path(video_path).name}: "
+                f"processed {len(idx_list)} frames "
+                f"(last source frame_idx={frame_idx}, total={total})"
+            )
 
     t = np.array(t_list, dtype=np.float32)
     frame_idx_arr = np.array(idx_list, dtype=np.int32)
