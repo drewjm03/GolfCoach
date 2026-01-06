@@ -18,6 +18,7 @@ data/**/*.json
 !data/frames/*.mp4
 *.pth
 !data/rig_configs/*.json
+!runs/**/*.npz
 
 __init__.py
 
