@@ -12,8 +12,10 @@ env/
 .venv_golfpose/
 
 data/**/*.png
+data/*.json
 data/**/*.json
-
+!data/frames/*.json
+!data/frames/*.mp4
 *.pth
 
 

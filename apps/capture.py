@@ -1,6 +1,7 @@
 import time, queue, cv2
 import threading
 from . import config
+import os
 
 def set_manual_exposure_uvc(cap, step=None):
     ok = False
@@ -115,10 +116,14 @@ class CamReader:
         self.record_thread = None
         self.record_written = 0
         self.record_dropped = 0
+        self.record_start_captured = 0
         self.record_first_ts = None
         self.record_last_ts = None
         self.record_path = None
         self.record_fps = None
+        self.record_gate = None      # optional threading.Event for synchronized start
+        self.record_armed = False    # armed but waiting for gate to open
+        self.record_ts_log = []      # list of written-frame timestamps
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -139,10 +144,15 @@ class CamReader:
             self.frames_captured += 1
             with self._lock:
                 self._latest = (ts, f)
-                # Enqueue for recording if enabled
-                if self.recording and self.record_writer is not None:
+                # Enqueue for recording if enabled and gate (if any) is open.
+                # Use f.copy() so the backing buffer is not reused unexpectedly
+                # by OpenCV/driver at high FPS.
+                gate_ok = (self.record_gate is None) or (
+                    getattr(self.record_gate, "is_set", lambda: True)()
+                )
+                if self.recording and self.record_writer is not None and gate_ok:
                     try:
-                        self.record_queue.put_nowait((ts, f))
+                        self.record_queue.put_nowait((ts, f.copy()))
                     except queue.Full:
                         # Drop the newest frame if queue is full
                         self.record_dropped += 1
@@ -181,6 +191,8 @@ class CamReader:
                 if self.record_first_ts is None:
                     self.record_first_ts = ts
                 self.record_last_ts = ts
+                # Log timestamps for offline sync analysis
+                self.record_ts_log.append(float(ts))
             except Exception as e:
                 print(f"[CV][REC] write failed: {e}")
 
@@ -222,14 +234,55 @@ class CamReader:
         self.record_writer = writer
         self.record_written = 0
         self.record_dropped = 0
+        # Snapshot frames captured so far to measure recording-window capture
+        self.record_start_captured = int(self.frames_captured)
         self.record_first_ts = None
         self.record_last_ts = None
+        self.record_ts_log = []
         self.record_path = path
         self.record_fps = float(fps)
+        self.record_gate = None
+        self.record_armed = False
         self.recording = True
         self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
         self.record_thread.start()
         print(f"[CV][REC] Started recording -> {path} @ {fps} fps")
+        return True
+
+    def arm_recording_mp4(self, path: str, fps: float, gate, fourcc: str = "mp4v") -> bool:
+        """Arm recording to an MP4 file, gated by an external Event.
+
+        Frames will begin being written once gate.is_set() is True, but
+        recording starts immediately so we don't miss early frames.
+        """
+        # Stop any existing recording first
+        if self.recording:
+            self.stop_recording()
+
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), float(fps), (w, h))
+        if not writer.isOpened():
+            print(f"[CV][REC] Failed to open VideoWriter for {path}")
+            return False
+
+        self.record_queue = queue.Queue(maxsize=300)
+        self.record_writer = writer
+        self.record_written = 0
+        self.record_dropped = 0
+        self.record_start_captured = int(self.frames_captured)
+        self.record_first_ts = None
+        self.record_last_ts = None
+        self.record_ts_log = []
+        self.record_path = path
+        self.record_fps = float(fps)
+        self.record_gate = gate
+        self.record_armed = True
+        self.recording = True
+        self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
+        self.record_thread.start()
+        # Intentionally do not treat this as "GO time"; gate controls that.
+        print(f"[CV][REC] Armed recording -> {path} @ {fps} fps")
         return True
 
     def stop_recording(self):
@@ -249,6 +302,7 @@ class CamReader:
 
         # Compute stats
         captured_total = int(self.frames_captured)
+        captured_window = int(self.frames_captured) - int(self.record_start_captured or 0)
         written = int(self.record_written)
         dropped = int(self.record_dropped)
         first_ts = self.record_first_ts
@@ -261,7 +315,8 @@ class CamReader:
             written_fps = 0.0
 
         print(
-            f"[CV][REC] Stats: captured={captured_total}, "
+            f"[CV][REC] Stats: captured_total={captured_total}, "
+            f"captured_during_recording={captured_window}, "
             f"written={written}, dropped={dropped}, "
             f"duration_written={duration_written:.3f}s, written_fps={written_fps:.2f}"
         )
@@ -270,11 +325,13 @@ class CamReader:
         if self.record_path:
             sidecar_path = os.path.splitext(self.record_path)[0] + "_stats.json"
             payload = {
-                "captured": captured_total,
+                "captured_total": captured_total,
+                "captured_during_recording": captured_window,
                 "written": written,
                 "dropped": dropped,
                 "duration_written": duration_written,
                 "written_fps": written_fps,
+                "ts": list(self.record_ts_log),
             }
             try:
                 import json

@@ -4,6 +4,7 @@ import time
 import argparse
 import queue
 import json
+import threading
 
 import cv2
 import numpy as np
@@ -115,6 +116,7 @@ def main():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     frames_dir = os.path.join(project_root, "data", "frames")
     os.makedirs(frames_dir, exist_ok=True)
+    print("[VIEW] frames_dir:", frames_dir)
     recording = False
 
     win = "Tag Viewer"
@@ -129,6 +131,8 @@ def main():
     except Exception:
         display_stride = 1
     frame_counter = 0
+    # Precompute camera-index -> array-index mapping to avoid repeated index lookups
+    idx_of = {cam_idx: i for i, cam_idx in enumerate(cam_indices)}
 
     try:
         while True:
@@ -188,14 +192,14 @@ def main():
                 # Show live capture FPS from CamReader plus local measured FPS
                 fps_cam = 0.0
                 try:
-                    cam = cams[cam_indices.index(cam_idx)]
+                    cam = cams[idx_of[cam_idx]]
                     fps_cam = float(getattr(cam, "fps", 0.0))
                 except Exception:
                     fps_cam = 0.0
 
                 fps_meas = 0.0
                 try:
-                    th = t_hist[cam_indices.index(cam_idx)]
+                    th = t_hist[idx_of[cam_idx]]
                     if len(th) >= 2 and (th[-1] - th[0]) > 0:
                         fps_meas = (len(th) - 1) / (th[-1] - th[0])
                 except Exception:
@@ -226,40 +230,53 @@ def main():
             k = cv2.waitKey(1) & 0xFF
 
             if k == ord("r"):
-                # Toggle recording of synchronized video streams using CamReader's recorder
+                # Toggle synchronized recording of all cameras using a shared gate Event
                 if not recording:
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
                     fps = getattr(config, "CAPTURE_FPS", 30)
-                    any_started = False
+                    gate = threading.Event()
+                    any_armed = False
                     for cam_idx, cam in zip(cam_indices, cams):
                         fname = f"record_{timestamp}_cam{cam_idx}.mp4"
                         out_path = os.path.join(frames_dir, fname)
                         ok = False
                         try:
-                            ok = cam.start_recording_mp4(out_path, fps, fourcc="mp4v")
+                            ok = cam.arm_recording_mp4(out_path, fps, gate, fourcc="mp4v")
                         except Exception as e:
-                            print(f"[VIEW][WARN] Failed to start recording for cam{cam_idx}: {e}")
+                            print(f"[VIEW][WARN] Failed to arm recording for cam{cam_idx}: {e}")
                         if ok:
-                            any_started = True
-                            print(f"[VIEW] Started recording cam{cam_idx} -> {out_path}")
-                    recording = any_started
-                    if not recording:
-                        print("[VIEW][WARN] No camera recordings started; recording disabled.")
+                            any_armed = True
+                            print(f"[VIEW] Armed recording cam{cam_idx} -> {out_path}")
+                    if any_armed:
+                        t0 = time.perf_counter()
+                        gate.set()
+                        recording = True
+                        print(f"[VIEW] Recording GO at t={t0:.6f}")
+                    else:
+                        print("[VIEW][WARN] No camera recordings armed; recording disabled.")
                 else:
                     # Stop per-camera recording; CamReader handles stats + JSON
                     for cam_idx, cam in zip(cam_indices, cams):
                         try:
-                            cam.stop_recording()
-                            print(f"[VIEW] Stopped recording cam{cam_idx}")
-                        except Exception:
-                            pass
+                            ret = cam.stop_recording()
+                            print(f"[VIEW] Stopped recording cam{cam_idx}, stop_recording() returned: {ret}")
+                        except Exception as e:
+                            print(f"[VIEW][ERR] stop_recording failed for cam{cam_idx}: {type(e).__name__}: {e}")
                     recording = False
 
             if k in (27, ord("q")):
                 print("[VIEW] Quit.")
                 break
     finally:
-        # Clean up cameras
+        # If we quit while recording, flush recordings + timestamp JSON
+        for cam_idx, cam in zip(cam_indices, cams):
+            try:
+                ret = cam.stop_recording()
+                print(f"[VIEW] Stopped recording cam{cam_idx} (shutdown), stop_recording() returned: {ret}")
+            except Exception as e:
+                print(f"[VIEW][ERR] stop_recording failed for cam{cam_idx} (shutdown): {type(e).__name__}: {e}")
+
+        # Clean up cameras and windows
         for c in cams:
             c.release()
         cv2.destroyAllWindows()
