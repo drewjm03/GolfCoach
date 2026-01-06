@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 from typing import List, Sequence, Tuple
 
+import os
+# Work around OpenMP runtime duplication on some Windows/PyTorch/OpenCV stacks.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import numpy as np
 import cv2
 

@@ -5,6 +5,10 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import os
+# Work around OpenMP runtime duplication on some Windows/PyTorch/OpenCV stacks.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import cv2
 import numpy as np
 
@@ -157,6 +161,30 @@ def _frame_path_candidates(base: Optional[Path], idx: int) -> List[Path]:
 		base / "img" / f"{n}.png",
 	]
 
+class _VideoCache:
+	def __init__(self) -> None:
+		self.cap_map: Dict[str, cv2.VideoCapture] = {}
+
+	def get_frame(self, video_path: Optional[str], frame_index: int) -> Optional[np.ndarray]:
+		if not video_path:
+			return None
+		if video_path not in self.cap_map:
+			if not os.path.exists(video_path):
+				return None
+			cap = cv2.VideoCapture(video_path)
+			if not cap.isOpened():
+				return None
+			self.cap_map[video_path] = cap
+		cap = self.cap_map[video_path]
+		try:
+			cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+			ok, frame = cap.read()
+			if not ok or frame is None:
+				return None
+			return frame
+		except Exception:
+			return None
+
 
 def _draw_circle(img: np.ndarray, pt: Tuple[float, float], color: Tuple[int, int, int], radius: int, thickness: int = -1) -> None:
 	if pt is None or not np.all(np.isfinite(pt)):
@@ -181,7 +209,9 @@ def _radius_from_conf(c: float, r_min: int = 2, r_max: int = 10, gamma: float = 
 
 def _overlay2d_video(out_path: Path, xy: np.ndarray, conf: np.ndarray, valid: np.ndarray, rejected: np.ndarray,
                      frame_idx: np.ndarray, image_size: Tuple[int, int],
-                     frame_paths: Optional[List[str]], frames_dir: Optional[Path], fps: int, legend: str) -> None:
+                     frame_paths: Optional[List[str]], frames_dir: Optional[Path],
+                     fps: int, legend: str,
+                     video_path: Optional[str] = None, vcache: Optional[_VideoCache] = None) -> None:
 	_safe_mkdir(out_path.parent)
 	W, H = int(image_size[0]), int(image_size[1])
 	W = W if W > 0 else 1280
@@ -189,11 +219,12 @@ def _overlay2d_video(out_path: Path, xy: np.ndarray, conf: np.ndarray, valid: np
 	writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
 	T, J, _ = xy.shape
 	for ti in range(T):
+		img = None
 		if frame_paths and ti < len(frame_paths) and frame_paths[ti]:
 			img = cv2.imread(frame_paths[ti], cv2.IMREAD_COLOR)
-			if img is None:
-				img = _resolve_frame_image(int(frame_idx[ti]), image_size, _frame_path_candidates(frames_dir, int(frame_idx[ti])) if frames_dir else [])
-		else:
+		if img is None and vcache is not None:
+			img = vcache.get_frame(video_path, int(frame_idx[ti]))
+		if img is None:
 			img = _resolve_frame_image(int(frame_idx[ti]), image_size, _frame_path_candidates(frames_dir, int(frame_idx[ti])) if frames_dir else [])
 		# Frame counter (top-left)
 		cnt_text = f"{ti + 1}/{T}  f:{int(frame_idx[ti])}"
@@ -216,8 +247,10 @@ def _overlay2d_video(out_path: Path, xy: np.ndarray, conf: np.ndarray, valid: np
 
 
 def _overlay_reproj_video(out_path: Path, u_obs: np.ndarray, reproj: np.ndarray, valid: np.ndarray, rejected: np.ndarray,
-                          frame_idx: np.ndarray, image_size: Tuple[int, int], frame_paths: Optional[List[str]], frames_dir: Optional[Path],
-                          fps: int, err_thr: float, title: str) -> None:
+                          frame_idx: np.ndarray, image_size: Tuple[int, int],
+                          frame_paths: Optional[List[str]], frames_dir: Optional[Path],
+                          fps: int, err_thr: float, title: str,
+                          video_path: Optional[str] = None, vcache: Optional[_VideoCache] = None) -> None:
 	_safe_mkdir(out_path.parent)
 	W, H = int(image_size[0]), int(image_size[1])
 	W = W if W > 0 else 1280
@@ -225,11 +258,12 @@ def _overlay_reproj_video(out_path: Path, u_obs: np.ndarray, reproj: np.ndarray,
 	writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
 	T, J, _ = u_obs.shape
 	for ti in range(T):
+		img = None
 		if frame_paths and ti < len(frame_paths) and frame_paths[ti]:
 			img = cv2.imread(frame_paths[ti], cv2.IMREAD_COLOR)
-			if img is None:
-				img = _resolve_frame_image(int(frame_idx[ti]), image_size, _frame_path_candidates(frames_dir, int(frame_idx[ti])) if frames_dir else [])
-		else:
+		if img is None and vcache is not None:
+			img = vcache.get_frame(video_path, int(frame_idx[ti]))
+		if img is None:
 			img = _resolve_frame_image(int(frame_idx[ti]), image_size, _frame_path_candidates(frames_dir, int(frame_idx[ti])) if frames_dir else [])
 		# Frame counter (top-left)
 		cnt_text = f"{ti + 1}/{T}  f:{int(frame_idx[ti])}"
@@ -321,6 +355,38 @@ def main() -> None:
 	# Load 2D pose and convert to "used/refined" (undistorted pixel space with P=K)
 	xyL_raw, confL, frame_paths_L, img_size_L = _extract_xy_conf_from_npz(args.pose2d_left)
 	xyR_raw, confR, frame_paths_R, img_size_R = _extract_xy_conf_from_npz(args.pose2d_right)
+	# Try to get video paths from pose2d npz (optional)
+	left_npz_raw = np.load(args.pose2d_left, allow_pickle=True)
+	right_npz_raw = np.load(args.pose2d_right, allow_pickle=True)
+	left_video_path = None
+	right_video_path = None
+	if "video_path" in left_npz_raw.files:
+		v = left_npz_raw["video_path"]
+		if isinstance(v, np.ndarray) and v.size > 0:
+			left_video_path = str(v.ravel()[0])
+	if "video_path" in right_npz_raw.files:
+		v = right_npz_raw["video_path"]
+		if isinstance(v, np.ndarray) and v.size > 0:
+			right_video_path = str(v.ravel()[0])
+
+	def _check_video_source(path: Optional[str], label: str) -> Optional[str]:
+		if not path or str(path).strip() == "":
+			print(f"[viz] {label} video_path: missing in pose2d npz; will fall back to frames_dir or blank canvas")
+			return None
+		if not os.path.exists(path):
+			print(f"[viz] {label} video_path not found: {path}")
+			return None
+		cap = cv2.VideoCapture(path)
+		if not cap.isOpened():
+			print(f"[viz] {label} video_path cannot be opened: {path}")
+			return None
+		cap.release()
+		print(f"[viz] {label} video_path OK: {path}")
+		return path
+
+	left_video_path = _check_video_source(left_video_path, "left")
+	right_video_path = _check_video_source(right_video_path, "right")
+	vcache = _VideoCache()
 	# Scale intrinsics if needed
 	Wc, Hc = int(img_sz_rig[0]), int(img_sz_rig[1])
 	Wn, Hn = int(img_size_L[0]), int(img_size_L[1])
@@ -361,12 +427,14 @@ def main() -> None:
 			S(u_used_left), S(confL), S(valid2d_left), S(rej2d_left),
 			S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps,
 			"Refined 2D (left). Dot size = confidence; rejected marked",
+			video_path=left_video_path, vcache=vcache,
 		)
 		_overlay2d_video(
 			out_dir / "overlay2d_right.mp4",
 			S(u_used_right), S(confR), S(valid2d_right), S(rej2d_right),
 			S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps,
 			"Refined 2D (right). Dot size = confidence; rejected marked",
+			video_path=right_video_path, vcache=vcache,
 		)
 
 	# Mode: reprojection overlays
@@ -378,12 +446,14 @@ def main() -> None:
 			S(u_used_left), S(reproj_opt_left), S(valid2d_left), S(rej2d_left),
 			S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps, args.err_thr,
 			"OBS vs REPROJ (OPT) - Left",
+			video_path=left_video_path, vcache=vcache,
 		)
 		_overlay_reproj_video(
 			out_dir / "reproj_right_opt.mp4",
 			S(u_used_right), S(reproj_opt_right), S(valid2d_right), S(rej2d_right),
 			S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps, args.err_thr,
 			"OBS vs REPROJ (OPT) - Right",
+			video_path=right_video_path, vcache=vcache,
 		)
 		if reproj_init_left is not None and reproj_init_right is not None:
 			_overlay_reproj_video(
@@ -391,12 +461,14 @@ def main() -> None:
 				S(u_used_left), S(reproj_init_left), S(valid2d_left), S(rej2d_left),
 				S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps, args.err_thr,
 				"OBS vs REPROJ (INIT) - Left",
+				video_path=left_video_path, vcache=vcache,
 			)
 			_overlay_reproj_video(
 				out_dir / "reproj_right_init.mp4",
 				S(u_used_right), S(reproj_init_right), S(valid2d_right), S(rej2d_right),
 				S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps, args.err_thr,
 				"OBS vs REPROJ (INIT) - Right",
+				video_path=right_video_path, vcache=vcache,
 			)
 
 	# Debug summary at a frame (default 79 if in range)
