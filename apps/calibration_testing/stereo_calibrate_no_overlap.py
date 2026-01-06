@@ -129,7 +129,7 @@ except Exception:
 
 # ====== TUNABLES (matching mono script) ======
 MIN_TAGS_PER_VIEW = 6
-MIN_SPAN = 0.20
+MIN_SPAN = 0.1
 MAX_VIEW_RMS_PX = 5.0
 
 # Wrapper for _best_kept_index to support both cameras

@@ -118,6 +118,8 @@ def main():
     os.makedirs(frames_dir, exist_ok=True)
     print("[VIEW] frames_dir:", frames_dir)
     recording = False
+    start_gate = None
+    stop_gate = None
 
     win = "Tag Viewer"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -127,11 +129,14 @@ def main():
     try:
         target_fps = float(getattr(config, "CAPTURE_FPS", 30))
         if target_fps >= 60:
-            display_stride = 2
+            display_stride = 4
+            print(f"[VIEW] Display stride: {display_stride}")
     except Exception:
         display_stride = 1
     frame_counter = 0
-    # Precompute camera-index -> array-index mapping to avoid repeated index lookups
+    # Precompute camera-index -> array-index mapping to avoid repeated index lookups.
+    # This index (0,1,...) is also used as the *logical* camera ID (cam0, cam1)
+    # so that cam0/cam1 are defined purely by CLI order, not OS enumeration.
     idx_of = {cam_idx: i for i, cam_idx in enumerate(cam_indices)}
 
     try:
@@ -189,23 +194,28 @@ def main():
                 except Exception:
                     pass
 
+                # Logical camera ID (0,1,...) based on CLI order, not OS index.
+                cam_logical = idx_of.get(cam_idx, 0)
+
                 # Show live capture FPS from CamReader plus local measured FPS
                 fps_cam = 0.0
                 try:
-                    cam = cams[idx_of[cam_idx]]
+                    cam = cams[cam_logical]
                     fps_cam = float(getattr(cam, "fps", 0.0))
                 except Exception:
                     fps_cam = 0.0
 
                 fps_meas = 0.0
                 try:
-                    th = t_hist[idx_of[cam_idx]]
+                    th = t_hist[cam_logical]
                     if len(th) >= 2 and (th[-1] - th[0]) > 0:
                         fps_meas = (len(th) - 1) / (th[-1] - th[0])
                 except Exception:
                     fps_meas = 0.0
 
-                label = f"cam{cam_idx} {fps_cam:4.1f}/{fps_meas:4.1f} fps tags={n_tags}"
+                # cam{cam_logical} guarantees that cam0 is always the first
+                # CLI camera (typically the left view), independent of OS index.
+                label = f"cam{cam_logical} {fps_cam:4.1f}/{fps_meas:4.1f} fps tags={n_tags}"
                 cv2.putText(vis, label, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
                 if tag_ids_strs[-1]:
                     cv2.putText(vis, f"ids: {tag_ids_strs[-1]}", (16, 64),
@@ -230,18 +240,27 @@ def main():
             k = cv2.waitKey(1) & 0xFF
 
             if k == ord("r"):
-                # Toggle synchronized recording of all cameras using a shared gate Event
+                # Toggle synchronized recording of all cameras using shared
+                # start/stop Events so both streams start and stop together.
                 if not recording:
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
                     fps = getattr(config, "CAPTURE_FPS", 30)
-                    gate = threading.Event()
+                    start_gate = threading.Event()
+                    stop_gate = threading.Event()
                     any_armed = False
-                    for cam_idx, cam in zip(cam_indices, cams):
-                        fname = f"record_{timestamp}_cam{cam_idx}.mp4"
+                    for logical_id, (cam_idx, cam) in enumerate(zip(cam_indices, cams)):
+                        # Use logical_id (0,1,...) for filenames so that
+                        # record_*_cam0.mp4 always corresponds to --cam0,
+                        # record_*_cam1.mp4 to --cam1, regardless of OS index.
+                        fname = f"record_{timestamp}_cam{logical_id}.mp4"
                         out_path = os.path.join(frames_dir, fname)
                         ok = False
                         try:
-                            ok = cam.arm_recording_mp4(out_path, fps, gate, fourcc="mp4v")
+                            # Provide the shared start gate via the API, and
+                            # attach the shared stop gate on the CamReader so
+                            # its enqueue/write loops can halt in sync.
+                            cam.record_stop_gate = stop_gate
+                            ok = cam.arm_recording_mp4(out_path, fps, start_gate, fourcc="mp4v")
                         except Exception as e:
                             print(f"[VIEW][WARN] Failed to arm recording for cam{cam_idx}: {e}")
                         if ok:
@@ -249,12 +268,17 @@ def main():
                             print(f"[VIEW] Armed recording cam{cam_idx} -> {out_path}")
                     if any_armed:
                         t0 = time.perf_counter()
-                        gate.set()
+                        start_gate.set()
                         recording = True
                         print(f"[VIEW] Recording GO at t={t0:.6f}")
                     else:
                         print("[VIEW][WARN] No camera recordings armed; recording disabled.")
                 else:
+                    # Trip the shared stop gate first so that all cameras halt
+                    # at (approximately) the same instant, then let each
+                    # CamReader flush and write stats/JSON.
+                    if stop_gate is not None:
+                        stop_gate.set()
                     # Stop per-camera recording; CamReader handles stats + JSON
                     for cam_idx, cam in zip(cam_indices, cams):
                         try:
@@ -268,7 +292,13 @@ def main():
                 print("[VIEW] Quit.")
                 break
     finally:
-        # If we quit while recording, flush recordings + timestamp JSON
+        # If we quit while recording, trip the shared stop gate (if any) so
+        # writers halt in sync, then flush recordings + timestamp JSON.
+        try:
+            if stop_gate is not None:
+                stop_gate.set()
+        except Exception:
+            pass
         for cam_idx, cam in zip(cam_indices, cams):
             try:
                 ret = cam.stop_recording()

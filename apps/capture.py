@@ -121,9 +121,10 @@ class CamReader:
         self.record_last_ts = None
         self.record_path = None
         self.record_fps = None
-        self.record_gate = None      # optional threading.Event for synchronized start
-        self.record_armed = False    # armed but waiting for gate to open
-        self.record_ts_log = []      # list of written-frame timestamps
+        self.record_gate = None       # optional threading.Event for synchronized start
+        self.record_stop_gate = None  # optional threading.Event for synchronized stop
+        self.record_armed = False     # armed but waiting for gate to open
+        self.record_ts_log = []       # list of written-frame timestamps
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -144,13 +145,17 @@ class CamReader:
             self.frames_captured += 1
             with self._lock:
                 self._latest = (ts, f)
-                # Enqueue for recording if enabled and gate (if any) is open.
+                # Enqueue for recording if enabled, the start gate (if any) is
+                # open, and the shared stop gate (if any) has not been tripped.
                 # Use f.copy() so the backing buffer is not reused unexpectedly
                 # by OpenCV/driver at high FPS.
                 gate_ok = (self.record_gate is None) or (
                     getattr(self.record_gate, "is_set", lambda: True)()
                 )
-                if self.recording and self.record_writer is not None and gate_ok:
+                stop_ok = (self.record_stop_gate is None) or (
+                    not getattr(self.record_stop_gate, "is_set", lambda: False)()
+                )
+                if self.recording and self.record_writer is not None and gate_ok and stop_ok:
                     try:
                         self.record_queue.put_nowait((ts, f.copy()))
                     except queue.Full:
@@ -177,7 +182,27 @@ class CamReader:
 
     def _record_loop(self):
         """Background thread that pulls frames from record_queue and writes them."""
+        # If a start gate is provided, block until it opens so multi-camera
+        # recordings can share a common "GO" instant.
+        gate = self.record_gate
+        if gate is not None:
+            try:
+                gate.wait()
+            except Exception:
+                pass
+
+        stop_gate = self.record_stop_gate
+
         while self.recording or not self.record_queue.empty():
+            # If a shared stop gate is provided, exit once it is set and the
+            # local queue has been drained. This ensures that all cameras stop
+            # writing near-simultaneously while still flushing buffered frames.
+            if (
+                stop_gate is not None
+                and getattr(stop_gate, "is_set", lambda: False)()
+                and self.record_queue.empty()
+            ):
+                break
             try:
                 ts, frame = self.record_queue.get(timeout=0.1)
             except queue.Empty:
@@ -242,6 +267,7 @@ class CamReader:
         self.record_path = path
         self.record_fps = float(fps)
         self.record_gate = None
+        self.record_stop_gate = None
         self.record_armed = False
         self.recording = True
         self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
@@ -250,10 +276,14 @@ class CamReader:
         return True
 
     def arm_recording_mp4(self, path: str, fps: float, gate, fourcc: str = "mp4v") -> bool:
-        """Arm recording to an MP4 file, gated by an external Event.
+        """Arm recording to an MP4 file, gated by an external start Event.
 
         Frames will begin being written once gate.is_set() is True, but
         recording starts immediately so we don't miss early frames.
+
+        For best-practice multi-camera sync with aligned stop times, callers
+        can additionally set self.record_stop_gate to a shared Event before
+        or immediately after arming (see tag_viewer).
         """
         # Stop any existing recording first
         if self.recording:
@@ -277,6 +307,10 @@ class CamReader:
         self.record_path = path
         self.record_fps = float(fps)
         self.record_gate = gate
+        # record_stop_gate is expected to be provided by the caller for
+        # multi-camera tools; default to None if not used.
+        if self.record_stop_gate is None:
+            self.record_stop_gate = None
         self.record_armed = True
         self.recording = True
         self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
