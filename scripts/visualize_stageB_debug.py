@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -138,6 +139,14 @@ def _resolve_frame_image(frame_idx: int, fallback_size: Tuple[int, int], candida
 			if img is not None:
 				return img
 	# Fallback: blank canvas
+	# Print this warning only once per run to avoid spamming every frame
+	if not hasattr(_resolve_frame_image, "_warned_once"):
+		if candidates:
+			try_list = ", ".join([str(p) for p in candidates])
+		else:
+			try_list = "(no candidate frame paths)"
+		print(f"[viz][warn] Could not resolve frame image (e.g., frame_idx={frame_idx}). Tried: {try_list}. Falling back to blank canvas. Further messages suppressed.", file=sys.stderr)
+		_resolve_frame_image._warned_once = True  # type: ignore[attr-defined]
 	W, H = int(fallback_size[0]), int(fallback_size[1])
 	W = W if W > 0 else 1280
 	H = H if H > 0 else 720
@@ -287,6 +296,10 @@ def main() -> None:
 	ap.add_argument("--mode", choices=["2d", "reproj", "3d", "all"], default="all")
 	ap.add_argument("--left_frames_dir", default=None)
 	ap.add_argument("--right_frames_dir", default=None)
+	ap.add_argument("--left_video", default=None, help="Optional: path to left camera MP4 to overlay directly.")
+	ap.add_argument("--right_video", default=None, help="Optional: path to right camera MP4 to overlay directly.")
+	ap.add_argument("--video_start_frame", type=int, default=0, help="Start frame index in original video where Stage A began.")
+	ap.add_argument("--use_video_fps", action="store_true", help="When using --left_video/--right_video, use source video FPS for output.")
 	ap.add_argument("--hide_club", action="store_true", help="Do not render club joints/edges in 3D viewer")
 	ap.add_argument("--all_green_3d", action="store_true", help="Render all joints in green (no outlier coloring) in 3D viewer")
 	ap.add_argument("--labels_3d", action="store_true", help="Show joint name labels in 3D viewer")
@@ -321,6 +334,10 @@ def main() -> None:
 	# Load 2D pose and convert to "used/refined" (undistorted pixel space with P=K)
 	xyL_raw, confL, frame_paths_L, img_size_L = _extract_xy_conf_from_npz(args.pose2d_left)
 	xyR_raw, confR, frame_paths_R, img_size_R = _extract_xy_conf_from_npz(args.pose2d_right)
+	if frame_paths_L is None and args.left_frames_dir is None and not args.left_video:
+		print("[viz][warn] pose2d_left has no 'frame_paths' and --left_frames_dir was not provided; overlays will use blank canvases if frames cannot be resolved.", file=sys.stderr)
+	if frame_paths_R is None and args.right_frames_dir is None and not args.right_video:
+		print("[viz][warn] pose2d_right has no 'frame_paths' and --right_frames_dir was not provided; overlays will use blank canvases if frames cannot be resolved.", file=sys.stderr)
 	# Scale intrinsics if needed
 	Wc, Hc = int(img_sz_rig[0]), int(img_sz_rig[1])
 	Wn, Hn = int(img_size_L[0]), int(img_size_L[1])
@@ -356,48 +373,290 @@ def main() -> None:
 	if args.mode in ("2d", "all"):
 		left_dir = Path(args.left_frames_dir) if args.left_frames_dir else None
 		right_dir = Path(args.right_frames_dir) if args.right_frames_dir else None
-		_overlay2d_video(
-			out_dir / "overlay2d_left.mp4",
-			S(u_used_left), S(confL), S(valid2d_left), S(rej2d_left),
-			S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps,
-			"Refined 2D (left). Dot size = confidence; rejected marked",
-		)
-		_overlay2d_video(
-			out_dir / "overlay2d_right.mp4",
-			S(u_used_right), S(confR), S(valid2d_right), S(rej2d_right),
-			S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps,
-			"Refined 2D (right). Dot size = confidence; rejected marked",
-		)
+		if args.left_video:
+			def _overlay2d_video_from_mp4(out_path: Path, xy: np.ndarray, conf: np.ndarray, valid: np.ndarray, rejected: np.ndarray,
+			                              frame_idx: np.ndarray, video_path: str, video_start_frame: int, base0_idx: int, fps: int, legend: str, use_video_fps: bool) -> None:
+				_safe_mkdir(out_path.parent)
+				cap = cv2.VideoCapture(video_path)
+				if not cap.isOpened():
+					raise RuntimeError(f"Could not open video: {video_path}")
+				src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+				W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+				writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), src_fps if use_video_fps else fps, (W, H))
+				T, J, _ = xy.shape
+				# Align to absolute video frames using base of the full sequence (ensures t0/t1 clip starts at correct time)
+				abs_frames = video_start_frame + (frame_idx.astype(np.int64) - int(base0_idx))
+				current_video_idx = 0
+				for ti in range(T):
+					target_idx = int(abs_frames[ti])
+					while current_video_idx < target_idx:
+						ret = cap.grab()
+						if not ret:
+							cap.release(); writer.release()
+							raise RuntimeError(f"Video ended while seeking to frame {target_idx}. Reached {current_video_idx}.")
+						current_video_idx += 1
+					ret, img = cap.read()
+					if not ret:
+						break
+					current_video_idx += 1
+					cnt_text = f"{ti + 1}/{T}  f:{int(frame_idx[ti])}"
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
+					for j in range(J):
+						pt = tuple(xy[ti, j].tolist())
+						c = float(conf[ti, j])
+						r = _radius_from_conf(c)
+						if rejected[ti, j]:
+							_draw_cross(img, pt, (0, 128, 255), size=6, thickness=2)
+						elif valid[ti, j]:
+							_draw_circle(img, pt, (0, 255, 0), r)
+						else:
+							_draw_circle(img, pt, (128, 128, 128), max(2, r // 2), thickness=1)
+					cv2.putText(img, legend, (30, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+					writer.write(img)
+				cap.release(); writer.release()
+				print(f"[viz] wrote {out_path}")
+			_overlay2d_video_from_mp4(
+				out_dir / "overlay2d_left.mp4",
+				S(u_used_left), S(confL), S(valid2d_left), S(rej2d_left),
+				S(frame_idx), args.left_video, int(args.video_start_frame), int(frame_idx[0]), args.fps,
+				"Refined 2D (left). Dot size = confidence; rejected marked", bool(args.use_video_fps),
+			)
+		else:
+			_overlay2d_video(
+				out_dir / "overlay2d_left.mp4",
+				S(u_used_left), S(confL), S(valid2d_left), S(rej2d_left),
+				S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps,
+				"Refined 2D (left). Dot size = confidence; rejected marked",
+			)
+		if args.right_video:
+			def _overlay2d_video_from_mp4(out_path: Path, xy: np.ndarray, conf: np.ndarray, valid: np.ndarray, rejected: np.ndarray,
+			                              frame_idx: np.ndarray, video_path: str, video_start_frame: int, base0_idx: int, fps: int, legend: str, use_video_fps: bool) -> None:
+				_safe_mkdir(out_path.parent)
+				cap = cv2.VideoCapture(video_path)
+				if not cap.isOpened():
+					raise RuntimeError(f"Could not open video: {video_path}")
+				src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+				W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+				writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), src_fps if use_video_fps else fps, (W, H))
+				T, J, _ = xy.shape
+				# Align to absolute video frames using base of the full sequence (ensures t0/t1 clip starts at correct time)
+				abs_frames = video_start_frame + (frame_idx.astype(np.int64) - int(base0_idx))
+				current_video_idx = 0
+				for ti in range(T):
+					target_idx = int(abs_frames[ti])
+					while current_video_idx < target_idx:
+						ret = cap.grab()
+						if not ret:
+							cap.release(); writer.release()
+							raise RuntimeError(f"Video ended while seeking to frame {target_idx}. Reached {current_video_idx}.")
+						current_video_idx += 1
+					ret, img = cap.read()
+					if not ret:
+						break
+					current_video_idx += 1
+					cnt_text = f"{ti + 1}/{T}  f:{int(frame_idx[ti])}"
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
+					for j in range(J):
+						pt = tuple(xy[ti, j].tolist())
+						c = float(conf[ti, j])
+						r = _radius_from_conf(c)
+						if rejected[ti, j]:
+							_draw_cross(img, pt, (0, 128, 255), size=6, thickness=2)
+						elif valid[ti, j]:
+							_draw_circle(img, pt, (0, 255, 0), r)
+						else:
+							_draw_circle(img, pt, (128, 128, 128), max(2, r // 2), thickness=1)
+					cv2.putText(img, legend, (30, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+					writer.write(img)
+				cap.release(); writer.release()
+				print(f"[viz] wrote {out_path}")
+			_overlay2d_video_from_mp4(
+				out_dir / "overlay2d_right.mp4",
+				S(u_used_right), S(confR), S(valid2d_right), S(rej2d_right),
+				S(frame_idx), args.right_video, int(args.video_start_frame), int(frame_idx[0]), args.fps,
+				"Refined 2D (right). Dot size = confidence; rejected marked", bool(args.use_video_fps),
+			)
+		else:
+			_overlay2d_video(
+				out_dir / "overlay2d_right.mp4",
+				S(u_used_right), S(confR), S(valid2d_right), S(rej2d_right),
+				S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps,
+				"Refined 2D (right). Dot size = confidence; rejected marked",
+			)
 
 	# Mode: reprojection overlays
 	if args.mode in ("reproj", "all"):
 		left_dir = Path(args.left_frames_dir) if args.left_frames_dir else None
 		right_dir = Path(args.right_frames_dir) if args.right_frames_dir else None
-		_overlay_reproj_video(
-			out_dir / "reproj_left_opt.mp4",
-			S(u_used_left), S(reproj_opt_left), S(valid2d_left), S(rej2d_left),
-			S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps, args.err_thr,
-			"OBS vs REPROJ (OPT) - Left",
-		)
-		_overlay_reproj_video(
-			out_dir / "reproj_right_opt.mp4",
-			S(u_used_right), S(reproj_opt_right), S(valid2d_right), S(rej2d_right),
-			S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps, args.err_thr,
-			"OBS vs REPROJ (OPT) - Right",
-		)
-		if reproj_init_left is not None and reproj_init_right is not None:
+		if args.left_video:
+			def _overlay_reproj_video_from_mp4(out_path: Path, u_obs: np.ndarray, reproj: np.ndarray, valid: np.ndarray, rejected: np.ndarray,
+			                                   frame_idx: np.ndarray, video_path: str, video_start_frame: int, base0_idx: int, fps: int, err_thr: float, title: str, use_video_fps: bool) -> None:
+				_safe_mkdir(out_path.parent)
+				cap = cv2.VideoCapture(video_path)
+				if not cap.isOpened():
+					raise RuntimeError(f"Could not open video: {video_path}")
+				src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+				W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+				writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), src_fps if use_video_fps else fps, (W, H))
+				T, J, _ = u_obs.shape
+				# Align to absolute video frames using base of the full sequence (ensures t0/t1 clip starts at correct time)
+				abs_frames = video_start_frame + (frame_idx.astype(np.int64) - int(base0_idx))
+				current_video_idx = 0
+				for ti in range(T):
+					target_idx = int(abs_frames[ti])
+					while current_video_idx < target_idx:
+						ret = cap.grab()
+						if not ret:
+							cap.release(); writer.release()
+							raise RuntimeError(f"Video ended while seeking to frame {target_idx}. Reached {current_video_idx}.")
+						current_video_idx += 1
+					ret, img = cap.read()
+					if not ret:
+						break
+					current_video_idx += 1
+					cnt_text = f"{ti + 1}/{T}  f:{int(frame_idx[ti])}"
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
+					for j in range(J):
+						pt_obs = u_obs[ti, j]
+						pt_rep = reproj[ti, j]
+						fin_obs = np.all(np.isfinite(pt_obs))
+						fin_rep = np.all(np.isfinite(pt_rep))
+						if not fin_obs and not fin_rep:
+							continue
+						if not fin_obs:
+							if fin_rep:
+								_draw_cross(img, tuple(pt_rep.tolist()), (128, 128, 128), size=4, thickness=1)
+							continue
+						if not fin_rep:
+							_draw_circle(img, tuple(pt_obs.tolist()), (128, 128, 128), 4)
+							continue
+						e = float(np.linalg.norm(pt_obs - pt_rep))
+						color = (0, 255, 0) if e < err_thr else (0, 0, 255)
+						if rejected[ti, j]:
+							color = (128, 128, 128)
+						_draw_circle(img, tuple(pt_obs.tolist()), color, 4)
+						_draw_cross(img, tuple(pt_rep.tolist()), color, size=5, thickness=2)
+						cv2.line(img, (int(round(pt_obs[0])), int(round(pt_obs[1]))), (int(round(pt_rep[0])), int(round(pt_rep[1]))), color, 1, cv2.LINE_AA)
+						if e >= err_thr:
+							cv2.putText(img, f"{e:.1f}", (int(round(pt_rep[0])) + 5, int(round(pt_rep[1])) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+					cv2.putText(img, title, (30, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+					writer.write(img)
+				cap.release(); writer.release()
+				print(f"[viz] wrote {out_path}")
+			_overlay_reproj_video_from_mp4(
+				out_dir / "reproj_left_opt.mp4",
+				S(u_used_left), S(reproj_opt_left), S(valid2d_left), S(rej2d_left),
+				S(frame_idx), args.left_video, int(args.video_start_frame), int(frame_idx[0]), args.fps, args.err_thr,
+				"OBS vs REPROJ (OPT) - Left", bool(args.use_video_fps),
+			)
+		else:
 			_overlay_reproj_video(
-				out_dir / "reproj_left_init.mp4",
-				S(u_used_left), S(reproj_init_left), S(valid2d_left), S(rej2d_left),
+				out_dir / "reproj_left_opt.mp4",
+				S(u_used_left), S(reproj_opt_left), S(valid2d_left), S(rej2d_left),
 				S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps, args.err_thr,
-				"OBS vs REPROJ (INIT) - Left",
+				"OBS vs REPROJ (OPT) - Left",
 			)
+		if args.right_video:
+			def _overlay_reproj_video_from_mp4(out_path: Path, u_obs: np.ndarray, reproj: np.ndarray, valid: np.ndarray, rejected: np.ndarray,
+			                                   frame_idx: np.ndarray, video_path: str, video_start_frame: int, base0_idx: int, fps: int, err_thr: float, title: str, use_video_fps: bool) -> None:
+				_safe_mkdir(out_path.parent)
+				cap = cv2.VideoCapture(video_path)
+				if not cap.isOpened():
+					raise RuntimeError(f"Could not open video: {video_path}")
+				src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+				W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+				writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), src_fps if use_video_fps else fps, (W, H))
+				T, J, _ = u_obs.shape
+				# Align to absolute video frames using base of the full sequence (ensures t0/t1 clip starts at correct time)
+				abs_frames = video_start_frame + (frame_idx.astype(np.int64) - int(base0_idx))
+				current_video_idx = 0
+				for ti in range(T):
+					target_idx = int(abs_frames[ti])
+					while current_video_idx < target_idx:
+						ret = cap.grab()
+						if not ret:
+							cap.release(); writer.release()
+							raise RuntimeError(f"Video ended while seeking to frame {target_idx}. Reached {current_video_idx}.")
+						current_video_idx += 1
+					ret, img = cap.read()
+					if not ret:
+						break
+					current_video_idx += 1
+					cnt_text = f"{ti + 1}/{T}  f:{int(frame_idx[ti])}"
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
+					cv2.putText(img, cnt_text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
+					for j in range(J):
+						pt_obs = u_obs[ti, j]
+						pt_rep = reproj[ti, j]
+						fin_obs = np.all(np.isfinite(pt_obs))
+						fin_rep = np.all(np.isfinite(pt_rep))
+						if not fin_obs and not fin_rep:
+							continue
+						if not fin_obs:
+							if fin_rep:
+								_draw_cross(img, tuple(pt_rep.tolist()), (128, 128, 128), size=4, thickness=1)
+							continue
+						if not fin_rep:
+							_draw_circle(img, tuple(pt_obs.tolist()), (128, 128, 128), 4)
+							continue
+						e = float(np.linalg.norm(pt_obs - pt_rep))
+						color = (0, 255, 0) if e < err_thr else (0, 0, 255)
+						if rejected[ti, j]:
+							color = (128, 128, 128)
+						_draw_circle(img, tuple(pt_obs.tolist()), color, 4)
+						_draw_cross(img, tuple(pt_rep.tolist()), color, size=5, thickness=2)
+						cv2.line(img, (int(round(pt_obs[0])), int(round(pt_obs[1]))), (int(round(pt_rep[0])), int(round(pt_rep[1]))), color, 1, cv2.LINE_AA)
+						if e >= err_thr:
+							cv2.putText(img, f"{e:.1f}", (int(round(pt_rep[0])) + 5, int(round(pt_rep[1])) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+					cv2.putText(img, title, (30, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+					writer.write(img)
+				cap.release(); writer.release()
+				print(f"[viz] wrote {out_path}")
+			_overlay_reproj_video_from_mp4(
+				out_dir / "reproj_right_opt.mp4",
+				S(u_used_right), S(reproj_opt_right), S(valid2d_right), S(rej2d_right),
+				S(frame_idx), args.right_video, int(args.video_start_frame), int(frame_idx[0]), args.fps, args.err_thr,
+				"OBS vs REPROJ (OPT) - Right", bool(args.use_video_fps),
+			)
+		else:
 			_overlay_reproj_video(
-				out_dir / "reproj_right_init.mp4",
-				S(u_used_right), S(reproj_init_right), S(valid2d_right), S(rej2d_right),
+				out_dir / "reproj_right_opt.mp4",
+				S(u_used_right), S(reproj_opt_right), S(valid2d_right), S(rej2d_right),
 				S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps, args.err_thr,
-				"OBS vs REPROJ (INIT) - Right",
+				"OBS vs REPROJ (OPT) - Right",
 			)
+		if reproj_init_left is not None and reproj_init_right is not None:
+			if args.left_video:
+				_overlay_reproj_video_from_mp4(
+					out_dir / "reproj_left_init.mp4",
+					S(u_used_left), S(reproj_init_left), S(valid2d_left), S(rej2d_left),
+					S(frame_idx), args.left_video, int(args.video_start_frame), int(frame_idx[0]), args.fps, args.err_thr,
+					"OBS vs REPROJ (INIT) - Left", bool(args.use_video_fps),
+				)
+			else:
+				_overlay_reproj_video(
+					out_dir / "reproj_left_init.mp4",
+					S(u_used_left), S(reproj_init_left), S(valid2d_left), S(rej2d_left),
+					S(frame_idx), img_size_L, frame_paths_L[t0:t1] if frame_paths_L else None, left_dir, args.fps, args.err_thr,
+					"OBS vs REPROJ (INIT) - Left",
+				)
+			if args.right_video:
+				_overlay_reproj_video_from_mp4(
+					out_dir / "reproj_right_init.mp4",
+					S(u_used_right), S(reproj_init_right), S(valid2d_right), S(rej2d_right),
+					S(frame_idx), args.right_video, int(args.video_start_frame), int(frame_idx[0]), args.fps, args.err_thr,
+					"OBS vs REPROJ (INIT) - Right", bool(args.use_video_fps),
+				)
+			else:
+				_overlay_reproj_video(
+					out_dir / "reproj_right_init.mp4",
+					S(u_used_right), S(reproj_init_right), S(valid2d_right), S(rej2d_right),
+					S(frame_idx), img_size_R, frame_paths_R[t0:t1] if frame_paths_R else None, right_dir, args.fps, args.err_thr,
+					"OBS vs REPROJ (INIT) - Right",
+				)
 
 	# Debug summary at a frame (default 79 if in range)
 	dbg_t = 79 if (79 >= t0 and 79 < t1) else t0
