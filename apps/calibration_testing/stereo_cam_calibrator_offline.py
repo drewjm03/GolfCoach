@@ -54,23 +54,6 @@ except Exception:
         K[0,2], K[1,2] = W*0.5, H*0.5
         return K
     
-    def calibrate_pinhole_full(obj_list, img_list, image_size, K_seed=None):
-        obj_std = [o.reshape(-1,3).astype(np.float32, copy=False) for o in obj_list]
-        img_std = [i.reshape(-1,2).astype(np.float32, copy=False) for i in img_list]
-        if K_seed is not None:
-            K = K_seed.copy().astype(np.float64)
-            D = np.zeros((8,1), dtype=np.float64)
-            flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_RATIONAL_MODEL)
-        else:
-            K = None
-            D = None
-            flags = cv2.CALIB_RATIONAL_MODEL
-        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-7)
-        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
-            obj_std, img_std, image_size, K, D, flags=flags, criteria=crit
-        )
-        return float(rms), K, D, rvecs, tvecs
-    
     def _save_diag_pinhole(path_png, frame_bgr, corners, ids, acc, K, D, rvec, tvec,
                            r_cyan=8, r_mag=3, draw_corners=True, draw_proj_corners=True):
         img = frame_bgr.copy()
@@ -146,6 +129,63 @@ def _best_kept_index_stereo(acc, kept_idxs, cam_idx=0):
         ids_list = acc.ids0 if cam_idx == 0 else acc.ids1
         counts = [0 if ids_list[i] is None else len(ids_list[i]) for i in kept_idxs]
         return int(np.argmax(counts))
+
+
+# ----- Mono calibration model override: Brown–Conrady 5-coeffs, better K seed -----
+
+def calibrate_pinhole_full(obj_list, img_list, image_size, K_seed=None):
+    """
+    Mono calibration using a Brown–Conrady pinhole model with 5 distortion
+    coefficients (k1, k2, p1, p2, k3).
+
+    - Uses CALIB_USE_INTRINSIC_GUESS only (no CALIB_RATIONAL_MODEL / prism / tilt).
+    - Seeds fx, fy from an approximate horizontal FOV (default 104.6 deg).
+    """
+    obj_std = [o.reshape(-1, 3).astype(np.float32, copy=False) for o in obj_list]
+    img_std = [i.reshape(-1, 2).astype(np.float32, copy=False) for i in img_list]
+
+    W, H = int(image_size[0]), int(image_size[1])
+
+    # Seed intrinsics from HFOV
+    hfov_deg = 104.6
+    fx = (W * 0.5) / np.tan(np.deg2rad(hfov_deg * 0.5))
+    fy = fx
+    cx, cy = W * 0.5, H * 0.5
+    K_init = np.array(
+        [[fx, 0.0, cx],
+         [0.0, fy, cy],
+         [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+    # 5-coeff Brown–Conrady: k1, k2, p1, p2, k3
+    D_init = np.zeros((5, 1), dtype=np.float64)
+
+    flags = cv2.CALIB_USE_INTRINSIC_GUESS
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-7)
+
+    rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+        obj_std, img_std, (W, H), K_init, D_init, flags=flags, criteria=crit
+    )
+
+    # Simple sanity checks on intrinsics/distortion; warn if they look unstable.
+    try:
+        k = np.asarray(D, dtype=np.float64).ravel()
+        if k.size >= 5:
+            k1, k2, p1, p2, k3 = k[:5]
+            if np.any(np.abs([k1, k2, k3]) > 1.0):
+                print(f"[CAL][WARN] Large radial distortion coefficients: k1={k1:.3f}, k2={k2:.3f}, k3={k3:.3f}")
+        cx_est, cy_est = float(K[0, 2]), float(K[1, 2])
+        cx0, cy0 = cx, cy
+        if abs(cx_est - cx0) > 0.25 * W or abs(cy_est - cy0) > 0.25 * H:
+            print(
+                f"[CAL][WARN] Principal point far from center: "
+                f"cx={cx_est:.1f} (seed {cx0:.1f}), cy={cy_est:.1f} (seed {cy0:.1f})"
+            )
+    except Exception:
+        pass
+
+    return float(rms), K, D, rvecs, tvecs
 
 # ---------- helpers ----------
 _APRIL_LOCAL_PICKLE = None
@@ -831,14 +871,9 @@ def main():
     img1_list_stereo = [acc.stereo_samples[i].img_pts1.reshape(-1, 1, 2).astype(np.float32) for i in good_idxs]
     print(f"[CAL] Stereo lists: obj={len(obj_list_stereo)} img0={len(img0_list_stereo)} img1={len(img1_list_stereo)}")
 
-    print("[CAL] Calibrating stereo extrinsics (intrinsics & full distortion model fixed)...")
-    # Match mono model: Rational + Thin-Prism + Tilted
-    flags_st = (
-        cv2.CALIB_FIX_INTRINSIC
-        | cv2.CALIB_RATIONAL_MODEL
-        | cv2.CALIB_THIN_PRISM_MODEL
-        | cv2.CALIB_TILTED_MODEL
-    )
+    print("[CAL] Calibrating stereo extrinsics (intrinsics fixed)...")
+    # Stereo step: intrinsics + 5-coeff distortion fixed; solve only for R/T.
+    flags_st = cv2.CALIB_FIX_INTRINSIC
     crit_st = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
     rms_st, K0_out, D0_out, K1_out, D1_out, R, T, E, F = cv2.stereoCalibrate(
         obj_list_stereo, img0_list_stereo, img1_list_stereo,

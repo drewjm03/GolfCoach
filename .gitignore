@@ -10,6 +10,7 @@ body_models/smplx/
 venv/
 env/
 .venv_golfpose/
+.venv_rerun/
 
 data/**/*.png
 data/*.json
