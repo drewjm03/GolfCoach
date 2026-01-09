@@ -12,9 +12,12 @@ env/
 .venv_golfpose/
 .venv_rerun/
 
+
 data/**/*.png
 data/*.json
 data/**/*.json
+!data/frames/**/*.mp4
+!data/frames/**/*.json
 !data/frames/*.json
 !data/frames/*.mp4
 *.pth
