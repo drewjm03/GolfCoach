@@ -20,15 +20,22 @@ def run_pose2d_on_video(
     device: str = "cpu",
     stride: int = 1,
     max_frames: Optional[int] = None,
-    detector_cfg: Optional[DetectorConfig] = None,
+	detector_cfg: Optional[DetectorConfig] = None,
+	force_center_bbox: bool = False,
+	force_bbox_frac: float = 2.0 / 3.0,
 ) -> Pose2DSequence:
     info = get_video_info(video_path)
     provider = GolfPose2DProvider(
         pose_config=pose_config,
         pose_checkpoint=pose_ckpt,
         device=device,
-        detector=detector_cfg,
+		detector=detector_cfg,
+		force_center_bbox=bool(force_center_bbox),
+		force_bbox_frac=float(force_bbox_frac),
     )
+
+	if force_center_bbox:
+		print(f"[POSE2D] Using forced center bbox: width_frac={float(force_bbox_frac):.4f} (central ~{float(force_bbox_frac)*100:.0f}%), full height; detector disabled")
 
     T_est = (info.frame_count + stride - 1) // stride if info.frame_count > 0 else 0
 
