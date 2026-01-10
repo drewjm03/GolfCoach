@@ -1,0 +1,15 @@
+{
+  "image_size": [
+    1280,
+    720
+  ],
+  "APRIL_DICT": 20,
+  "board_source": "grid8x5",
+  "april_pickle": "",
+  "harvard_tag_size_m": null,
+  "harvard_tag_spacing_m": null,
+  "corner_order": "2,3,0,1",
+  "target_keyframes": 60,
+  "accept_period": 0.25,
+  "no_overlap": true
+}

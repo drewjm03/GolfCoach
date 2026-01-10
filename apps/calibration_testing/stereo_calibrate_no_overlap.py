@@ -859,56 +859,58 @@ def main():
             obj0_list, img0_list = obj0_list2, img0_list2
     
     # Mono calibration for cam1 (same logic)
+    # Ensure kept1 is always defined so later diagnostics can safely reference it
+    kept1 = []
     if not have_intrinsics:
         print("[CAL] Calibrating mono intrinsics for cam1...")
         obj1_list, img1_list, kept1 = [], [], []
         drop_no_ids = drop_few_tags = drop_coverage = drop_no_map = 0
     
         for vi, (corners_img, ids_img) in enumerate(zip(acc.corners1, acc.ids1)):
-        if ids_img is None:
-            drop_no_ids += 1
-            continue
-        if len(ids_img) < MIN_TAGS_PER_VIEW:
-            drop_few_tags += 1
-            continue
-        if not _has_coverage(corners_img, W, H, MIN_SPAN):
-            drop_coverage += 1
-            continue
-        O, I = [], []
-        for c, iv in zip(corners_img, ids_img):
-            tid = int(iv[0])
-            if tid not in acc.id_to_obj:
+            if ids_img is None:
+                drop_no_ids += 1
                 continue
-            O.append(acc.id_to_obj[tid])
-            I.append(c.reshape(-1, 2))
-        if O:
-            obj_cat = np.concatenate(O, 0).astype(np.float64).reshape(-1, 1, 3)
-            img_cat = np.concatenate(I, 0).astype(np.float64).reshape(-1, 1, 2)
-            obj1_list.append(obj_cat)
-            img1_list.append(img_cat)
-            kept1.append(vi)
-        else:
-            drop_no_map += 1
+            if len(ids_img) < MIN_TAGS_PER_VIEW:
+                drop_few_tags += 1
+                continue
+            if not _has_coverage(corners_img, W, H, MIN_SPAN):
+                drop_coverage += 1
+                continue
+            O, I = [], []
+            for c, iv in zip(corners_img, ids_img):
+                tid = int(iv[0])
+                if tid not in acc.id_to_obj:
+                    continue
+                O.append(acc.id_to_obj[tid])
+                I.append(c.reshape(-1, 2))
+            if O:
+                obj_cat = np.concatenate(O, 0).astype(np.float64).reshape(-1, 1, 3)
+                img_cat = np.concatenate(I, 0).astype(np.float64).reshape(-1, 1, 2)
+                obj1_list.append(obj_cat)
+                img1_list.append(img_cat)
+                kept1.append(vi)
+            else:
+                drop_no_map += 1
     
-    if (drop_no_ids + drop_few_tags + drop_coverage + drop_no_map) > 0:
-        print(f"[CAL] Cam1 filter: kept={len(kept1)}  no_ids={drop_no_ids}  few_tags={drop_few_tags}  coverage={drop_coverage}  no_map={drop_no_map}")
+        if (drop_no_ids + drop_few_tags + drop_coverage + drop_no_map) > 0:
+            print(f"[CAL] Cam1 filter: kept={len(kept1)}  no_ids={drop_no_ids}  few_tags={drop_few_tags}  coverage={drop_coverage}  no_map={drop_no_map}")
     
-    if not obj1_list:
-        print("[CAL] Cam1: Not enough valid samples after filtering; aborting.")
-        return
+        if not obj1_list:
+            print("[CAL] Cam1: Not enough valid samples after filtering; aborting.")
+            return
     
-    rms1, K1, D1, rvecs1, tvecs1 = calibrate_pinhole_full(obj1_list, img1_list, image_size, K_seed)
-    print(f"[CAL] Cam1 RMS: {rms1:.3f} (D has {D1.size if D1 is not None else 0} coeffs)")
-    _print_intrinsics(K1, D1)
+        rms1, K1, D1, rvecs1, tvecs1 = calibrate_pinhole_full(obj1_list, img1_list, image_size, K_seed)
+        print(f"[CAL] Cam1 RMS: {rms1:.3f} (D has {D1.size if D1 is not None else 0} coeffs)")
+        _print_intrinsics(K1, D1)
     
-    # Optional view-level RMS pruning for cam1
-    if MAX_VIEW_RMS_PX > 0:
-        # Debug: log per-view RMS before pruning
-        print("[CAL] Cam1 per-view RMS:")
-        for vi, (O, I) in enumerate(zip(obj1_list, img1_list)):
-            rv, tv = rvecs1[vi], tvecs1[vi]
-            view_rms = _view_rms_pinhole(O, I, K1, D1, rv, tv)
-            print(f"  view {vi:03d} (global index {kept1[vi]}): {view_rms:.2f} px")
+        # Optional view-level RMS pruning for cam1
+        if MAX_VIEW_RMS_PX > 0:
+            # Debug: log per-view RMS before pruning
+            print("[CAL] Cam1 per-view RMS:")
+            for vi, (O, I) in enumerate(zip(obj1_list, img1_list)):
+                rv, tv = rvecs1[vi], tvecs1[vi]
+                view_rms = _view_rms_pinhole(O, I, K1, D1, rv, tv)
+                print(f"  view {vi:03d} (global index {kept1[vi]}): {view_rms:.2f} px")
 
         keep_mask1 = []
         for vi, (O, I) in enumerate(zip(obj1_list, img1_list)):

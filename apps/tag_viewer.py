@@ -40,6 +40,12 @@ def main():
     parser.add_argument("--cam0", type=int, default=0, help="Camera index for first camera.")
     parser.add_argument("--cam1", type=int, default=None,
                         help="Optional second camera index. If omitted, only cam0 is used.")
+    parser.add_argument(
+        "--force_bbox_frac",
+        type=float,
+        default=None,
+        help="If set (0<frac<=1), draw a fixed yellow bbox of full height and center frac of the width.",
+    )
 
     args, _ = parser.parse_known_args()
 
@@ -220,6 +226,16 @@ def main():
                 if tag_ids_strs[-1]:
                     cv2.putText(vis, f"ids: {tag_ids_strs[-1]}", (16, 64),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # Optional fixed central bbox overlay (full height, center width fraction).
+                if args.force_bbox_frac is not None and args.force_bbox_frac > 0.0:
+                    frac = min(float(args.force_bbox_frac), 1.0)
+                    h_vis, w_vis = vis.shape[:2]
+                    box_w = int(round(w_vis * frac))
+                    if box_w > 0:
+                        x0 = max((w_vis - box_w) // 2, 0)
+                        x1 = min(x0 + box_w, w_vis - 1)
+                        cv2.rectangle(vis, (x0, 0), (x1, h_vis - 1), (0, 255, 255), 2)
                 annotated.append(vis)
 
             # Compose output canvas (stack horizontally or vertically depending on number of cams)
