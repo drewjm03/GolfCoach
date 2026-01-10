@@ -645,6 +645,15 @@ def main():
                         help="Tag spacing (meters) for Harvard board (informational)")
     parser.add_argument("--corner-order", type=str, default=None,
                         help="Manual corner order override as four comma-separated indices, e.g. '0,1,2,3'")
+    # New options for wizard integration
+    parser.add_argument("--intrinsics0", type=str, default=None,
+                        help="Path to cam0 intrinsics JSON (image_size,K,D).")
+    parser.add_argument("--intrinsics1", type=str, default=None,
+                        help="Path to cam1 intrinsics JSON (image_size,K,D).")
+    parser.add_argument("--skip-mono", action="store_true",
+                        help="Skip mono calibration and load intrinsics from --intrinsics0/--intrinsics1.")
+    parser.add_argument("--out-json", type=str, default=None,
+                        help="Output rig JSON path. If not provided, default under data/ with timestamp.")
     args = parser.parse_known_args()[0]
     
     # Set globals for board construction
@@ -752,8 +761,39 @@ def main():
         print("[CAL] Not enough valid samples; aborting.")
         return
     
+    # Optionally skip mono calibration by loading intrinsics
+    have_intrinsics = bool(args.skip_mono) or (args.intrinsics0 and args.intrinsics1)
+    K0 = D0 = K1 = D1 = None
+    rms0 = rms1 = float("nan")
+
+    def _load_intrinsics(path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        imsz = data.get("image_size")
+        K = np.asarray(data.get("K"), dtype=np.float64)
+        D = np.asarray(data.get("D"), dtype=np.float64)
+        D = D.reshape(-1, 1) if D.ndim == 1 else D
+        return imsz, K, D
+
+    if have_intrinsics:
+        if not (args.intrinsics0 and args.intrinsics1):
+            print("[CAL] --skip-mono requires both --intrinsics0 and --intrinsics1; aborting.")
+            return
+        try:
+            im0, K0, D0 = _load_intrinsics(args.intrinsics0)
+            im1, K1, D1 = _load_intrinsics(args.intrinsics1)
+        except Exception as e:
+            print(f"[CAL] Failed to load intrinsics: {e}")
+            return
+        if not im0 or not im1:
+            print("[CAL] Intrinsics missing image_size; aborting.")
+            return
+        if list(im0) != [W, H] or list(im1) != [W, H]:
+            raise ValueError(f"[CAL] image_size mismatch: keyframes={W}x{H}, intr0={im0}, intr1={im1}")
+
     # Mono calibration for cam0 (using same logic as mono script)
-    print("[CAL] Calibrating mono intrinsics for cam0...")
+    if not have_intrinsics:
+        print("[CAL] Calibrating mono intrinsics for cam0...")
     K_seed = seed_K_pinhole(W, H, f_scale=1.0)
     obj0_list, img0_list, kept0 = [], [], []
     drop_no_ids = drop_few_tags = drop_coverage = drop_no_map = 0
@@ -819,11 +859,12 @@ def main():
             obj0_list, img0_list = obj0_list2, img0_list2
     
     # Mono calibration for cam1 (same logic)
-    print("[CAL] Calibrating mono intrinsics for cam1...")
-    obj1_list, img1_list, kept1 = [], [], []
-    drop_no_ids = drop_few_tags = drop_coverage = drop_no_map = 0
+    if not have_intrinsics:
+        print("[CAL] Calibrating mono intrinsics for cam1...")
+        obj1_list, img1_list, kept1 = [], [], []
+        drop_no_ids = drop_few_tags = drop_coverage = drop_no_map = 0
     
-    for vi, (corners_img, ids_img) in enumerate(zip(acc.corners1, acc.ids1)):
+        for vi, (corners_img, ids_img) in enumerate(zip(acc.corners1, acc.ids1)):
         if ids_img is None:
             drop_no_ids += 1
             continue
@@ -883,13 +924,14 @@ def main():
             kept1 = [k for k, m in zip(kept1, keep_mask1) if m]
             obj1_list, img1_list = obj1_list2, img1_list2
     
-    # ----- Save mono diagnostic overlays (always, even if stereo fails later) -----
+    # ----- Save mono diagnostic overlays (only if mono was run) -----
     repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
     out_dir = os.path.join(repo_root, "data")
     os.makedirs(out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     diag_dir = os.path.join(out_dir, f"stereo_offline_diag_{stamp}")
-    os.makedirs(diag_dir, exist_ok=True)
+    if not have_intrinsics:
+        os.makedirs(diag_dir, exist_ok=True)
 
     # Best view indices per cam (by number of points)
     best0_idx = _best_kept_index_stereo(acc, kept0, cam_idx=0) if kept0 else 0
@@ -914,25 +956,27 @@ def main():
     best_corners1 = acc.corners1[view1_idx] if view1_idx < len(acc.corners1) else acc.corners1[0]
     best_ids1 = acc.ids1[view1_idx] if view1_idx < len(acc.ids1) else acc.ids1[0]
 
-    # Get corresponding rvec/tvec
-    rvec0_best = rvecs0[best0_idx] if best0_idx < len(rvecs0) else rvecs0[0]
-    tvec0_best = tvecs0[best0_idx] if best0_idx < len(tvecs0) else tvecs0[0]
-    rvec1_best = rvecs1[best1_idx] if best1_idx < len(rvecs1) else rvecs1[0]
-    tvec1_best = tvecs1[best1_idx] if best1_idx < len(tvecs1) else tvecs1[0]
+    # Get corresponding rvec/tvec (only if mono ran)
+    if not have_intrinsics:
+        rvec0_best = rvecs0[best0_idx] if best0_idx < len(rvecs0) else rvecs0[0]
+        tvec0_best = tvecs0[best0_idx] if best0_idx < len(tvecs0) else tvecs0[0]
+        rvec1_best = rvecs1[best1_idx] if best1_idx < len(rvecs1) else rvecs1[0]
+        tvec1_best = tvecs1[best1_idx] if best1_idx < len(tvecs1) else tvecs1[0]
 
     # Save single best-view diagnostics
-    out_png0 = os.path.join(diag_dir, f"stereo_offline_cam0_diag_{stamp}.png")
-    _save_diag_pinhole(out_png0, frame0_bgr_diag, best_corners0, best_ids0, acc, K0, D0,
-                       rvec0_best, tvec0_best, r_cyan=8, r_mag=3)
-    print(f"[SAVE] Cam0 diagnostic -> {out_png0}")
-
-    out_png1 = os.path.join(diag_dir, f"stereo_offline_cam1_diag_{stamp}.png")
-    _save_diag_pinhole(out_png1, frame1_bgr_diag, best_corners1, best_ids1, acc, K1, D1,
-                       rvec1_best, tvec1_best, r_cyan=8, r_mag=3)
-    print(f"[SAVE] Cam1 diagnostic -> {out_png1}")
+    if not have_intrinsics:
+        out_png0 = os.path.join(diag_dir, f"stereo_offline_cam0_diag_{stamp}.png")
+        _save_diag_pinhole(out_png0, frame0_bgr_diag, best_corners0, best_ids0, acc, K0, D0,
+                           rvec0_best, tvec0_best, r_cyan=8, r_mag=3)
+        print(f"[SAVE] Cam0 diagnostic -> {out_png0}")
+        
+        out_png1 = os.path.join(diag_dir, f"stereo_offline_cam1_diag_{stamp}.png")
+        _save_diag_pinhole(out_png1, frame1_bgr_diag, best_corners1, best_ids1, acc, K1, D1,
+                           rvec1_best, tvec1_best, r_cyan=8, r_mag=3)
+        print(f"[SAVE] Cam1 diagnostic -> {out_png1}")
 
     # Save overlays for all kept frames if requested
-    if args.save_all_diag:
+    if args.save_all_diag and not have_intrinsics:
         for idx, (vi0, O0, I0) in enumerate(zip(kept0, obj0_list, img0_list)):
             view_idx0 = vi0
             if view_idx0 < len(acc.corners0):
@@ -1068,7 +1112,7 @@ def main():
     print(f"[CAL] T (cam1<-cam0): {T.flatten()}")
 
     # Save calibration JSON (no essential matrix / fundamental matrix here)
-    out_json = os.path.join(out_dir, f"stereo_offline_calibration_no_overlap_{stamp}.json")
+    out_json = os.path.join(out_dir, f"stereo_offline_calibration_no_overlap_{stamp}.json") if not args.out_json else os.path.abspath(args.out_json)
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump({
             "image_size": [W, H],

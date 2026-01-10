@@ -110,11 +110,16 @@ def main():
 
     # Recording folder and meta (same format as stereo_calib_plot)
     repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
-    base_out = os.path.join(repo_root, "data") if not args.out_dir else os.path.abspath(args.out_dir)
-    os.makedirs(base_out, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    record_dir = os.path.join(base_out, f"stereo_keyframes_{stamp}")
-    os.makedirs(record_dir, exist_ok=True)
+    # If --out-dir is provided, write directly there; otherwise create stamped subdir under data/
+    if args.out_dir:
+        record_dir = os.path.abspath(args.out_dir)
+        os.makedirs(record_dir, exist_ok=True)
+    else:
+        base_out = os.path.join(repo_root, "data")
+        os.makedirs(base_out, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        record_dir = os.path.join(base_out, f"stereo_keyframes_{stamp}")
+        os.makedirs(record_dir, exist_ok=True)
 
     meta = {
         "image_size": [int(W), int(H)],
