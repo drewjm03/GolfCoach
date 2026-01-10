@@ -30,30 +30,30 @@ def main() -> None:
     ap.add_argument("--det_ema", type=float, default=0.8)
     ap.add_argument("--det_pad_scale", type=float, default=1.25)
 
-	# Forced center bbox mode (disables detector)
-	ap.add_argument("--force_center_bbox", action="store_true", help="Use central bbox (2/3 width, full height) and disable detector.")
-	ap.add_argument("--force_bbox_frac", type=float, default=0.6666667, help="Width fraction for forced bbox (default: 2/3).")
+    # Forced center bbox mode (disables detector)
+    ap.add_argument("--force_center_bbox", action="store_true", help="Use central bbox (2/3 width, full height) and disable detector.")
+    ap.add_argument("--force_bbox_frac", type=float, default=0.6666667, help="Width fraction for forced bbox (default: 2/3).")
 
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-	detector_cfg = None
-	if args.force_center_bbox:
-		if args.det_config or args.det_ckpt:
-			print("[POSE2D] --force_center_bbox enabled; ignoring --det_config/--det_ckpt.")
-	else:
-		if args.det_config and args.det_ckpt:
-			detector_cfg = DetectorConfig(
-				config=args.det_config,
-				checkpoint=args.det_ckpt,
-				device=args.det_device,
-				score_thr=args.det_score_thr,
-				class_id=args.det_class_id,
-				ema=args.det_ema,
-				pad_scale=args.det_pad_scale,
-			)
+    detector_cfg = None
+    if args.force_center_bbox:
+        if args.det_config or args.det_ckpt:
+            print("[POSE2D] --force_center_bbox enabled; ignoring --det_config/--det_ckpt.")
+    else:
+        if args.det_config and args.det_ckpt:
+            detector_cfg = DetectorConfig(
+                config=args.det_config,
+                checkpoint=args.det_ckpt,
+                device=args.det_device,
+                score_thr=args.det_score_thr,
+                class_id=args.det_class_id,
+                ema=args.det_ema,
+                pad_scale=args.det_pad_scale,
+            )
 
     left_out = out_dir / "pose2d_left.npz"
     right_out = out_dir / "pose2d_right.npz"
@@ -66,9 +66,9 @@ def main() -> None:
         device=args.device,
         stride=args.stride,
         max_frames=args.max_frames,
-		detector_cfg=detector_cfg,
-		force_center_bbox=bool(args.force_center_bbox),
-		force_bbox_frac=float(args.force_bbox_frac),
+        detector_cfg=detector_cfg,
+        force_center_bbox=bool(args.force_center_bbox),
+        force_bbox_frac=float(args.force_bbox_frac),
     )
 
     run_pose2d_on_video(
@@ -79,9 +79,9 @@ def main() -> None:
         device=args.device,
         stride=args.stride,
         max_frames=args.max_frames,
-		detector_cfg=detector_cfg,
-		force_center_bbox=bool(args.force_center_bbox),
-		force_bbox_frac=float(args.force_bbox_frac),
+        detector_cfg=detector_cfg,
+        force_center_bbox=bool(args.force_center_bbox),
+        force_bbox_frac=float(args.force_bbox_frac),
     )
 
     print(f"Wrote:\n  {left_out}\n  {right_out}")
