@@ -128,12 +128,24 @@ def render_pose2d_overlay(
                     p2 = tuple(np.round(kpts[row, j]).astype(int).tolist())
                     cv2.line(frame, p1, p2, (255, 0, 0), style.thickness)
 
-            # keypoints
+            # keypoints (dot size correlated with confidence)
             for j in range(J):
-                if conf[row, j] < style.conf_thresh:
+                c = float(conf[row, j])
+                if c < style.conf_thresh:
                     continue
                 x, y = np.round(kpts[row, j]).astype(int)
-                cv2.circle(frame, (x, y), style.radius, (0, 255, 0), -1)
+
+                # Map confidence in [conf_thresh, 1] → radius scale ~ [0.5, 1.5] * base radius.
+                # This keeps dots visible but emphasizes high-confidence joints.
+                if c >= 1.0:
+                    scale = 1.5
+                else:
+                    denom = max(1e-6, 1.0 - style.conf_thresh)
+                    alpha = max(0.0, min(1.0, (c - style.conf_thresh) / denom))
+                    scale = 0.5 + alpha  # 0.5 .. 1.5
+                radius = max(1, int(round(style.radius * scale)))
+
+                cv2.circle(frame, (x, y), radius, (0, 255, 0), -1)
 
                 if style.draw_labels:
                     name = joint_names[j] if j < len(joint_names) else str(j)
