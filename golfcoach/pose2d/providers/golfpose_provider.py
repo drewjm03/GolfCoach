@@ -42,27 +42,27 @@ class GolfPose2DProvider:
     Optionally runs a detector to get that bbox.
     """
 
-	def __init__(
-		self,
-		pose_config: str,
-		pose_checkpoint: str,
-		device: str = "cpu",
-		detector: Optional[DetectorConfig] = None,
-		force_center_bbox: bool = False,
-		force_bbox_frac: float = 2.0 / 3.0,
-	) -> None:
+    def __init__(
+        self,
+        pose_config: str,
+        pose_checkpoint: str,
+        device: str = "cpu",
+        detector: Optional[DetectorConfig] = None,
+        force_center_bbox: bool = False,
+        force_bbox_frac: float = 2.0 / 3.0,
+    ) -> None:
         self.pose_model = init_pose_model(pose_config, pose_checkpoint, device=device)
         self.pose_model.cfg.visualizer = None  # avoid GUI
 
-		self.force_center_bbox = bool(force_center_bbox)
-		self.force_bbox_frac = float(force_bbox_frac)
+        self.force_center_bbox = bool(force_center_bbox)
+        self.force_bbox_frac = float(force_bbox_frac)
 
-		self.detector_cfg = None if self.force_center_bbox else detector
-		self.det_model = None
-		if self.detector_cfg is not None:
-			if not _HAS_MMDET:
-				raise RuntimeError("mmdet is not importable but detector config was provided.")
-			self.det_model = init_detector(self.detector_cfg.config, self.detector_cfg.checkpoint, device=self.detector_cfg.device)
+        self.detector_cfg = None if self.force_center_bbox else detector
+        self.det_model = None
+        if self.detector_cfg is not None:
+            if not _HAS_MMDET:
+                raise RuntimeError("mmdet is not importable but detector config was provided.")
+            self.det_model = init_detector(self.detector_cfg.config, self.detector_cfg.checkpoint, device=self.detector_cfg.device)
 
         # Read keypoint names from dataset meta if available (recommended to verify ordering!)
         meta = getattr(self.pose_model, "dataset_meta", None) or {}
@@ -75,21 +75,21 @@ class GolfPose2DProvider:
 
         self._prev_bbox: Optional[np.ndarray] = None
 
-	def _forced_center_bbox(self, W: int, H: int, width_frac: float = 2.0 / 3.0) -> np.ndarray:
-		width_frac = float(np.clip(width_frac, 0.05, 1.0))
-		crop_w = width_frac * float(W - 1)
-		cx = 0.5 * float(W - 1)
-		x0 = cx - 0.5 * crop_w
-		x1 = cx + 0.5 * crop_w
-		y0 = 0.0
-		y1 = float(H - 1)
-		bbox = np.array([x0, y0, x1, y1], dtype=np.float64)
-		# clamp to valid bounds
-		bbox[0] = max(0.0, min(bbox[0], float(W - 1)))
-		bbox[2] = max(0.0, min(bbox[2], float(W - 1)))
-		bbox[1] = max(0.0, min(bbox[1], float(H - 1)))
-		bbox[3] = max(0.0, min(bbox[3], float(H - 1)))
-		return bbox
+    def _forced_center_bbox(self, W: int, H: int, width_frac: float = 2.0 / 3.0) -> np.ndarray:
+        width_frac = float(np.clip(width_frac, 0.05, 1.0))
+        crop_w = width_frac * float(W - 1)
+        cx = 0.5 * float(W - 1)
+        x0 = cx - 0.5 * crop_w
+        x1 = cx + 0.5 * crop_w
+        y0 = 0.0
+        y1 = float(H - 1)
+        bbox = np.array([x0, y0, x1, y1], dtype=np.float64)
+        # clamp to valid bounds
+        bbox[0] = max(0.0, min(bbox[0], float(W - 1)))
+        bbox[2] = max(0.0, min(bbox[2], float(W - 1)))
+        bbox[1] = max(0.0, min(bbox[1], float(H - 1)))
+        bbox[3] = max(0.0, min(bbox[3], float(H - 1)))
+        return bbox
 
     def _expand_bbox(self, bbox: np.ndarray, W: int, H: int, pad_scale: float) -> np.ndarray:
         x1, y1, x2, y2 = bbox.astype(np.float64)
@@ -163,13 +163,13 @@ class GolfPose2DProvider:
         """
         H, W = frame_bgr.shape[:2]
 
-		if bbox is None:
-			if self.force_center_bbox:
-				bbox = self._forced_center_bbox(W, H, self.force_bbox_frac)
-			elif self.det_model is not None:
-				bbox = self._detect_bbox(frame_bgr)
-			else:
-				bbox = np.array([0, 0, W - 1, H - 1], dtype=np.float64)
+        if bbox is None:
+            if self.force_center_bbox:
+                bbox = self._forced_center_bbox(W, H, self.force_bbox_frac)
+            elif self.det_model is not None:
+                bbox = self._detect_bbox(frame_bgr)
+            else:
+                bbox = np.array([0, 0, W - 1, H - 1], dtype=np.float64)
 
         # mmpose 1.3.x: prefer bboxes array API over raw person dicts
         bboxes = np.array([bbox], dtype=np.float32)  # (1,4)
